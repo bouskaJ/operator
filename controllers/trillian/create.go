@@ -12,7 +12,6 @@ import (
 	"github.com/securesign/operator/controllers/constants"
 	trillianUtils "github.com/securesign/operator/controllers/trillian/utils"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
@@ -44,9 +43,19 @@ func (i createAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Trilli
 	//log := ctrllog.FromContext(ctx)
 	var err error
 
-	dbLabels := kubernetes.FilterCommonLabels(instance.Labels)
-	dbLabels["app.kubernetes.io/component"] = ComponentName
-	dbLabels["app.kubernetes.io/name"] = dbDeploymentName
+	if instance.Spec.TrillianDB.Create && instance.Spec.TrillianDB.Url != "" {
+		err = common.InvalidConfigurationError("db.create and db.url configuration can't be used at once")
+		i.Logger.Error(err, "Can't use db.create and db.url at once")
+		instance.Status.Phase = rhtasv1alpha1.PhaseError
+		return instance, err
+	}
+
+	if instance.Spec.TrillianDB.Url != "" && instance.Spec.TrillianDB.ConnectionSecret == "" {
+		err = common.InvalidConfigurationError("db.connectionSecret is not set")
+		i.Logger.Error(err, "You need to configure connection secret together with provided DB")
+		instance.Status.Phase = rhtasv1alpha1.PhaseError
+		return instance, err
+	}
 
 	logSignerLabels := kubernetes.FilterCommonLabels(instance.Labels)
 	logSignerLabels["app.kubernetes.io/component"] = ComponentName
@@ -56,24 +65,19 @@ func (i createAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Trilli
 	logServerLabels["app.kubernetes.io/component"] = ComponentName
 	logServerLabels["app.kubernetes.io/name"] = logserverDeploymentName
 
-	dbSecret := i.createDbSecret(instance.Namespace, dbLabels)
-	controllerutil.SetControllerReference(instance, dbSecret, i.Client.Scheme())
-	if err = i.Client.Create(ctx, dbSecret); err != nil {
-		instance.Status.Phase = rhtasv1alpha1.PhaseError
-		return instance, fmt.Errorf("could not create secret: %w", err)
-	}
+	if instance.Spec.TrillianDB.Create {
+		dbLabels := kubernetes.FilterCommonLabels(instance.Labels)
+		dbLabels["app.kubernetes.io/component"] = ComponentName
+		dbLabels["app.kubernetes.io/name"] = dbDeploymentName
 
-	var trillPVC string
-	if instance.Spec.PvcName == "" {
-		pvc := kubernetes.CreatePVC(instance.Namespace, "trillian-mysql", "5Gi")
-		controllerutil.SetControllerReference(instance, pvc, i.Client.Scheme())
-		if err = i.Client.Create(ctx, pvc); err != nil {
-			instance.Status.Phase = rhtasv1alpha1.PhaseError
-			return instance, fmt.Errorf("could not create pvc: %w", err)
+		if instance.Spec.TrillianDB.ConnectionSecret != "" {
+			i.createDbSecret(ctx, instance, dbLabels)
 		}
-		trillPVC = pvc.Name
-	} else {
-		trillPVC = instance.Spec.PvcName
+		dbPVC := instance.Spec.TrillianDB.PvcName
+		if dbPVC == "" {
+			i.createDbPVC(ctx, instance, dbLabels)
+		}
+
 	}
 
 	db := trillianUtils.CreateTrillDb(instance.Namespace, constants.TrillianDbImage, dbDeploymentName, trillPVC, dbSecret.Name, dbLabels)
@@ -83,12 +87,14 @@ func (i createAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Trilli
 		return instance, fmt.Errorf("could not create trillian DB: %w", err)
 	}
 
-	mysql := kubernetes.CreateService(instance.Namespace, "trillian-mysql", 3306, dbLabels)
+	mysqlPort := 3306
+	mysql := kubernetes.CreateService(instance.Namespace, "trillian-mysql", mysqlPort, dbLabels)
 	controllerutil.SetControllerReference(instance, mysql, i.Client.Scheme())
 	if err = i.Client.Create(ctx, mysql); err != nil {
 		instance.Status.Phase = rhtasv1alpha1.PhaseError
 		return instance, fmt.Errorf("could not create service: %w", err)
 	}
+	instance.Status.DBUrl = fmt.Sprintf("%s.%s.svc:%d", mysql.Name, mysql.Namespace, mysqlPort)
 
 	// Log Server
 	svcName := "trillian-logserver"
@@ -144,22 +150,26 @@ func (i createAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Trilli
 
 }
 
-func (i createAction) createDbSecret(namespace string, labels map[string]string) *corev1.Secret {
-	// Define a new Secret object
-	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: "rhtas",
-			Namespace:    namespace,
-			Labels:       labels,
-		},
-		Type: "Opaque",
-		Data: map[string][]byte{
-			// generate a random password for the mysql root user and the mysql password
-			// TODO - use a random password generator
-			"mysql-root-password": []byte("password"),
-			"mysql-password":      []byte("password"),
-			"mysql-database":      []byte("trillian"),
-			"mysql-user":          []byte("mysql"),
-		},
+func (i createAction) createDbSecret(ctx context.Context, instance *rhtasv1alpha1.Trillian, labels map[string]string) (*corev1.Secret, error) {
+	secret := kubernetes.CreateSecret(dbDeploymentName, instance.Namespace, map[string][]byte{
+		// generate a random password for the mysql root user and the mysql password
+		// TODO - use a random password generator
+		"mysql-root-password": []byte("password"),
+		"mysql-password":      []byte("password"),
+		"mysql-database":      []byte("trillian"),
+		"mysql-user":          []byte("mysql"),
+	}, labels)
+	controllerutil.SetControllerReference(instance, secret, i.Client.Scheme())
+	err := i.Client.Create(ctx, secret)
+	return secret, err
+}
+
+func (i createAction) createDbPVC(ctx context.Context, instance *rhtasv1alpha1.Trillian, labels map[string]string) (*corev1.PersistentVolumeClaim, error) {
+	pvc := kubernetes.CreatePVC(instance.Namespace, "trillian-mysql", "5Gi", labels)
+	controllerutil.SetControllerReference(instance, pvc, i.Client.Scheme())
+	if err := i.Client.Create(ctx, pvc); err != nil {
+		instance.Status.Phase = rhtasv1alpha1.PhaseError
+		return nil, fmt.Errorf("could not create pvc: %w", err)
 	}
+	return pvc, nil
 }

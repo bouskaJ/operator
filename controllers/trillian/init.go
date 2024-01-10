@@ -61,6 +61,8 @@ func (i initializeAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Tr
 		return instance, fmt.Errorf("could not create Trillian tree: %w", err)
 	}
 
+	err = utils.CreateDB(ctx)
+
 	instance.Status.TreeID = tree.TreeId
 	instance.Status.Phase = rhtasv1alpha1.PhaseReady
 	return instance, nil
