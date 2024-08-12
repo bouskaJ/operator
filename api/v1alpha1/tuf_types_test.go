@@ -6,7 +6,9 @@ import (
 	"golang.org/x/net/context"
 	_ "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 )
 
 var _ = Describe("TUF", func() {
@@ -186,6 +188,7 @@ var _ = Describe("TUF", func() {
 })
 
 func generateTufObject(name string) *Tuf {
+	storage := resource.MustParse("5Gi")
 	return &Tuf{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -209,6 +212,10 @@ func generateTufObject(name string) *Tuf {
 				{
 					Name: "tsa.certchain.pem",
 				},
+			},
+			Pvc: Pvc{
+				Retain: ptr.To(true),
+				Size:   &storage,
 			},
 		},
 	}
