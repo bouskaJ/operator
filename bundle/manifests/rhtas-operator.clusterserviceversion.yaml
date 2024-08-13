@@ -740,7 +740,7 @@ spec:
                 env:
                 - name: OPENSHIFT
                   value: "true"
-                image: registry.redhat.io/rhtas/rhtas-rhel9-operator@sha256:a21f7128694a64989bf0d84a7a7da4c1ffc89edf62d594dc8bea7bcfe9ac08d3
+                image: registry.redhat.io/rhtas/rhtas-rhel9-operator@sha256:bceca35b05bcb4e6a3d37e0e3f4921e7414b12fb4dbd8d80ec67d0e674c774ac
                 livenessProbe:
                   httpGet:
                     path: /healthz
