@@ -24,7 +24,7 @@ spec:
   - name: output-image
     value: quay.io/redhat-user-workloads-stage/jbouska-tenant/test/operator:{{revision}}
   - name: dockerfile
-    value: Dockerfile.rhtas-operator.rh
+    value: Dockerfile
   pipelineSpec:
     finally:
     - name: show-sbom

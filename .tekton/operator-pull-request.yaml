@@ -23,11 +23,11 @@ spec:
   - name: revision
     value: '{{revision}}'
   - name: output-image
-    value: quay.io/jbouska/securesign-controller:on-pr-{{revision}}
+    value: quay.io/redhat-user-workloads-stage/jbouska-tenant/test/operator:on-pr-{{revision}}
   - name: image-expires-after
     value: 5d
   - name: dockerfile
-    value: Dockerfile.rhtas-operator.rh
+    value: Dockerfile
   pipelineSpec:
     finally:
     - name: show-sbom
