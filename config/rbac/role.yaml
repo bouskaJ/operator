@@ -74,6 +74,36 @@ rules:
   - update
   - watch
 - apiGroups:
+  - build.openshift.io
+  resources:
+  - build
+  verbs:
+  - create
+  - get
+  - update
+- apiGroups:
+  - build.openshift.io
+  resources:
+  - build/log
+  verbs:
+  - get
+- apiGroups:
+  - build.openshift.io
+  resources:
+  - buildconfigs
+  verbs:
+  - create
+  - get
+  - update
+- apiGroups:
+  - build.openshift.io
+  resources:
+  - buildconfigs/instantiatebinary
+  verbs:
+  - create
+  - get
+  - update
+- apiGroups:
   - console.openshift.io
   resources:
   - consoleclidownloads
@@ -159,6 +189,23 @@ rules:
   - patch
   - update
   - watch
+- apiGroups:
+  - image.openshift.io
+  resources:
+  - imagestreams
+  verbs:
+  - create
+  - get
+  - patch
+  - update
+- apiGroups:
+  - image.openshift.io
+  resources:
+  - imagestreamtags
+  verbs:
+  - create
+  - get
+  - update
 - apiGroups:
   - monitoring.coreos.com
   resources:

@@ -114,7 +114,7 @@ spec:
               pvc:
                 default:
                   retain: true
-                  size: 1Gi
+                  size: 5Gi
                 description: PVC configuration
                 properties:
                   name:

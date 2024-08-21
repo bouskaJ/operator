@@ -72,6 +72,13 @@ type SecuresignReconciler struct {
 //+kubebuilder:rbac:groups="",resources=endpoints,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;get;list;watch;update;patch
 //+kubebuilder:rbac:groups="operator.openshift.io",resources=consoles,verbs=get;list
+//+kubebuilder:rbac:groups=image.openshift.io,resources=imagestreams,verbs=get;update;create;patch
+//+kubebuilder:rbac:groups=image.openshift.io,resources=imagestreamtags,verbs=get;update;create
+//+kubebuilder:rbac:groups=build.openshift.io,resources=buildconfigs,verbs=get;update;create
+//+kubebuilder:rbac:groups=build.openshift.io,resources=buildconfigs/instantiatebinary,verbs=get;update;create
+//+kubebuilder:rbac:groups=build.openshift.io,resources=buildconfigs/instantiatebinary,verbs=get;update;create
+//+kubebuilder:rbac:groups=build.openshift.io,resources=build,verbs=get;update;create
+//+kubebuilder:rbac:groups=build.openshift.io,resources=build/log,verbs=get
 
 // TODO: rework Securesign controller to watch resources
 func (r *SecuresignReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

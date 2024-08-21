@@ -71,6 +71,36 @@ func (i rbacAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Tuf) *ac
 			Resources: []string{"secrets"},
 			Verbs:     []string{"create", "get", "update"},
 		},
+		{
+			APIGroups: []string{"image.openshift.io"},
+			Resources: []string{"imagestreams"},
+			Verbs:     []string{"create", "get", "update", "patch"},
+		},
+		{
+			APIGroups: []string{"image.openshift.io"},
+			Resources: []string{"imagestreamtags"},
+			Verbs:     []string{"create", "get", "update"},
+		},
+		{
+			APIGroups: []string{"build.openshift.io"},
+			Resources: []string{"buildconfigs"},
+			Verbs:     []string{"create", "get", "update"},
+		},
+		{
+			APIGroups: []string{"build.openshift.io"},
+			Resources: []string{"build"},
+			Verbs:     []string{"create", "get", "update"},
+		},
+		{
+			APIGroups: []string{"build.openshift.io"},
+			Resources: []string{"buildconfigs/instantiatebinary"},
+			Verbs:     []string{"create", "get", "update"},
+		},
+		{
+			APIGroups: []string{"build.openshift.io"},
+			Resources: []string{"builds/log"},
+			Verbs:     []string{"get"},
+		},
 	})
 
 	if err = ctrl.SetControllerReference(instance, role, i.Client.Scheme()); err != nil {

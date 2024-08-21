@@ -52,7 +52,7 @@ func CreateTrillDeployment(instance *v1alpha1.Trillian, image string, dpName str
 					InitContainers: []core.Container{
 						{
 							Name:  "wait-for-trillian-db",
-							Image: constants.TrillianNetcatImage,
+							Image: constants.OseToolsImage,
 							Env: []core.EnvVar{
 								{
 									Name: "MYSQL_HOSTNAME",

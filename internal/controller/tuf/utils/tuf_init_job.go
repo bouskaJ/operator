@@ -1,6 +1,8 @@
 package utils
 
 import (
+	"fmt"
+
 	"github.com/operator-framework/operator-lib/proxy"
 	"github.com/securesign/operator/api/v1alpha1"
 	"github.com/securesign/operator/internal/controller/constants"
@@ -11,6 +13,7 @@ import (
 )
 
 func CreateTufInitJob(instance *v1alpha1.Tuf, name string, sa string, labels map[string]string) *v1.Job {
+	isName := "repository-" + instance.Name
 	env := []core.EnvVar{
 		{
 			Name:  "NAMESPACE",
@@ -28,13 +31,10 @@ func CreateTufInitJob(instance *v1alpha1.Tuf, name string, sa string, labels map
 			Parallelism: ptr.To[int32](1),
 			Completions: ptr.To[int32](1),
 
-			BackoffLimit: ptr.To[int32](3),
 			Template: core.PodTemplateSpec{
 				Spec: core.PodSpec{
-					// this should be enough to create repository
-					ActiveDeadlineSeconds: ptr.To[int64](60),
-					ServiceAccountName:    sa,
-					RestartPolicy:         core.RestartPolicyOnFailure,
+					ServiceAccountName: sa,
+					RestartPolicy:      core.RestartPolicyNever,
 					Volumes: []core.Volume{
 						{
 							Name: "tuf-secrets",
@@ -45,13 +45,18 @@ func CreateTufInitJob(instance *v1alpha1.Tuf, name string, sa string, labels map
 						{
 							Name: "repository",
 							VolumeSource: core.VolumeSource{
-								PersistentVolumeClaim: &core.PersistentVolumeClaimVolumeSource{
-									ClaimName: instance.Status.PvcName,
-								},
+								EmptyDir: &core.EmptyDirVolumeSource{},
+							},
+						},
+						{
+							Name: "dockerfile",
+							VolumeSource: core.VolumeSource{
+								EmptyDir: &core.EmptyDirVolumeSource{},
 							},
 						},
 					},
-					Containers: []core.Container{
+
+					InitContainers: []core.Container{
 						{
 							Name:  "tuf-init",
 							Image: constants.TufImage,
@@ -68,11 +73,47 @@ func CreateTufInitJob(instance *v1alpha1.Tuf, name string, sa string, labels map
 								{
 									Name:      "repository",
 									MountPath: "/var/run/target",
-									ReadOnly:  false,
+								},
+							},
+						},
+						{
+							Name:    "dockerfile-init",
+							Image:   constants.OseToolsImage,
+							Env:     env,
+							Command: []string{"/bin/bash", "-c"},
+							Args: []string{
+								"echo 'FROM registry.access.redhat.com/ubi9/ubi-minimal:9.4 \n COPY . /var/run/repository' > /var/run/dockerfile/Dockerfile ",
+							},
+							VolumeMounts: []core.VolumeMount{
+								{
+									Name:      "dockerfile",
+									MountPath: "/var/run/dockerfile",
 								},
 							},
 						},
 					},
+					Containers: []core.Container{
+						{
+							Name:    "init-build",
+							Image:   constants.OseToolsImage,
+							Env:     env,
+							Command: []string{"/bin/bash", "-c"},
+							Args: []string{
+								fmt.Sprintf("oc new-build --strategy=docker --binary --name=%s --to=%s:1 && "+
+									"oc set image-lookup %s &&"+
+									"oc start-build %s --from-dir=/var/run/target --from-dir=/var/run/dockerfile --follow", isName, isName, isName, isName),
+							},
+							VolumeMounts: []core.VolumeMount{
+								{
+									Name:      "repository",
+									MountPath: "/var/run/target",
+								},
+								{
+									Name:      "dockerfile",
+									MountPath: "/var/run/dockerfile",
+								},
+							},
+						}},
 				},
 			},
 		},

@@ -10,7 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-func CreatePVC(namespace string, pvcName string, pvcSize resource.Quantity, storageClass string, accessModes []corev1.PersistentVolumeAccessMode, labels map[string]string) *corev1.PersistentVolumeClaim {
+func CreatePVC(namespace string, pvcName string, pvcSize resource.Quantity, storageClass string, labels map[string]string) *corev1.PersistentVolumeClaim {
 	var computedStorageClass *string
 	if storageClass == "" {
 		computedStorageClass = nil
@@ -25,7 +25,9 @@ func CreatePVC(namespace string, pvcName string, pvcSize resource.Quantity, stor
 			Labels:    labels,
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: accessModes,
+			AccessModes: []corev1.PersistentVolumeAccessMode{
+				"ReadWriteOnce",
+			},
 			Resources: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceStorage: pvcSize,

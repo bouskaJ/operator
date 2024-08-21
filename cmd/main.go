@@ -107,7 +107,7 @@ func main() {
 	utils.StringFlagOrEnv(&constants.TrillianLogSignerImage, "trillian-log-signer-image", "TRILLIAN_LOG_SIGNER_IMAGE", constants.TrillianLogSignerImage, "The image used for trillian log signer.")
 	utils.StringFlagOrEnv(&constants.TrillianServerImage, "trillian-log-server-image", "TRILLIAN_LOG_SERVER_IMAGE", constants.TrillianServerImage, "The image used for trillian log server.")
 	utils.StringFlagOrEnv(&constants.TrillianDbImage, "trillian-db-image", "TRILLIAN_DB_IMAGE", constants.TrillianDbImage, "The image used for trillian's database.")
-	utils.StringFlagOrEnv(&constants.TrillianNetcatImage, "trillian-netcat-image", "TRILLIAN_NETCAT_IMAGE", constants.TrillianNetcatImage, "The image used for trillian netcat.")
+	utils.StringFlagOrEnv(&constants.OseToolsImage, "trillian-netcat-image", "TRILLIAN_NETCAT_IMAGE", constants.OseToolsImage, "The image used for trillian netcat.")
 	utils.StringFlagOrEnv(&constants.FulcioServerImage, "fulcio-server-image", "FULCIO_SERVER_IMAGE", constants.FulcioServerImage, "The image used for the fulcio server.")
 	utils.StringFlagOrEnv(&constants.RekorRedisImage, "rekor-redis-image", "REKOR_REDIS_IMAGE", constants.RekorRedisImage, "The image used for redis.")
 	utils.StringFlagOrEnv(&constants.RekorServerImage, "rekor-server-image", "REKOR_SERVER_IMAGE", constants.RekorServerImage, "The image used for rekor server.")

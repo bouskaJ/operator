@@ -1,6 +1,8 @@
 package utils
 
 import (
+	"fmt"
+
 	"github.com/securesign/operator/api/v1alpha1"
 	"github.com/securesign/operator/internal/controller/common/utils"
 	"github.com/securesign/operator/internal/controller/constants"
@@ -36,13 +38,12 @@ func CreateTufDeployment(instance *v1alpha1.Tuf, dpName string, sa string, label
 								Projected: secretsVolumeProjection(instance.Status.Keys),
 							},
 						},
+					},
+					InitContainers: []core.Container{
 						{
-							Name: "repository",
-							VolumeSource: core.VolumeSource{
-								PersistentVolumeClaim: &core.PersistentVolumeClaimVolumeSource{
-									ClaimName: instance.Status.PvcName,
-								},
-							},
+							Name:    "tuf-repository",
+							Image:   "image-registry.openshift-image-registry.svc:5000/test/repository-tuf-sample:1",
+							Command: []string{"/bin/bash", "-c", fmt.Sprintf("cp -r %s %s", "/var/run/repository", "/var/run/target")},
 						},
 					},
 					Containers: []core.Container{
@@ -69,11 +70,6 @@ func CreateTufDeployment(instance *v1alpha1.Tuf, dpName string, sa string, label
 								{
 									Name:      "tuf-secrets",
 									MountPath: "/var/run/tuf-secrets",
-								},
-								{
-									Name:      "repository",
-									MountPath: "/var/run/target",
-									ReadOnly:  true,
 								},
 							},
 							LivenessProbe: &core.Probe{
