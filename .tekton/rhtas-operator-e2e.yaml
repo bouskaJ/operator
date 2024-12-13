@@ -195,19 +195,15 @@ spec:
               - name: credentials
                 value: credentials
           - name: git-clone
-            params:
-              - name: source-url
-                value: "$(tasks.parse-metadata.results.bundle-source-url)"
-              - name: source-revision
-                value: "$(tasks.parse-metadata.results.bundle-source-revision)"
             image: registry.access.redhat.com/ubi9/go-toolset@sha256:c7bfd2501cb1be171366434a368db669b32f08a0198c1473b9bff0a379613fc3
             volumeMounts:
               - name: repository
                 mountPath: /repository
             script: |
-              git clone $(params.source-url) /repository
               cd /repository
-              git checkout $(params.source-revision)
+              git clone $(tasks.parse-metadata.results.bundle-source-url) source
+              cd source
+              git checkout $(tasks.parse-metadata.results.bundle-source-revision)
           - name: install-keycloak
             ref:
               resolver: git
@@ -225,6 +221,8 @@ spec:
                 value: repository
               - name: KUBECONFIG
                 value: "$(steps.get-kubeconfig.results.kubeconfig)"
+              - name: workdir
+                value: source
           - name: get-tuftool
             ref:
               resolver: git
@@ -266,7 +264,7 @@ spec:
               - name: binaries
                 mountPath: /binaries
             script: |
-              cd /repository
+              cd /repository/source
               export PATH="$PATH:/binaries"
               export OIDC_ISSUER_URL=https://$OIDC_HOST/auth/realms/trusted-artifact-signer
               openssl s_client -connect $OIDC_HOST:443 > /tmp/ssl.cert
