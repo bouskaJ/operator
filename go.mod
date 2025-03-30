@@ -1,6 +1,8 @@
 module github.com/securesign/operator
 
-go 1.21
+go 1.22
+
+toolchain go1.22.9
 
 require (
 	github.com/blang/semver/v4 v4.0.0
@@ -22,7 +24,7 @@ require (
 	golang.org/x/exp v0.0.0-20240213143201-ec583247a57a
 	golang.org/x/net v0.25.0
 	google.golang.org/grpc v1.62.1
-	google.golang.org/protobuf v1.33.0
+	google.golang.org/protobuf v1.36.6
 	gopkg.in/yaml.v2 v2.4.0
 	k8s.io/api v0.29.2
 	k8s.io/apiextensions-apiserver v0.29.2
