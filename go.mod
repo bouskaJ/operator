@@ -19,7 +19,7 @@ require (
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/sigstore/fulcio v1.4.4
 	github.com/sigstore/sigstore v1.8.1
-	golang.org/x/exp v0.0.0-20240213143201-ec583247a57a
+	golang.org/x/exp ce4c2cf36ca6
 	golang.org/x/net v0.25.0
 	google.golang.org/grpc v1.62.1
 	google.golang.org/protobuf v1.33.0
