@@ -10,9 +10,9 @@ env:
   GO_VERSION: 1.26
   REGISTRY: ghcr.io
   CONTAINER_TOOL: podman
-  IMG: ghcr.io/securesign/secure-sign-operator:dev-${{ github.sha }}
-  BUNDLE_IMG: ghcr.io/securesign/secure-sign-operator-bundle:dev-${{ github.sha }}
-  CATALOG_IMG: ghcr.io/securesign/secure-sign-operator-fbc:dev-${{ github.sha }}
+  IMG: ghcr.io/bouskaj/operator/operator:dev-${{ github.sha }}
+  BUNDLE_IMG: ghcr.io/bouskaj/operator/bundle:dev-${{ github.sha }}
+  CATALOG_IMG: ghcr.io/bouskaj/operator/fbc:dev-${{ github.sha }}
   NEW_OLM_CHANNEL: rhtas-operator.v1.5.0
   OCP_VERSION: ${{ vars.OLM_INDEX_VERSION }}
   INGRESS_HOST_TEMPLATE: '%[1]s.%[2]s.127.0.0.1.nip.io'
