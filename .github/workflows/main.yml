@@ -17,7 +17,7 @@ env:
   OCP_VERSION: ${{ vars.OLM_INDEX_VERSION }}
   INGRESS_HOST_TEMPLATE: '%[1]s.%[2]s.127.0.0.1.nip.io'
   TARGET_PLATFORM: kubernetes
-  SNAPSHOT_REGISTRY: ghcr.io/${{ github.repository_owner }}/operator-vind-snapshot
+  SNAPSHOT_REGISTRY: ghcr.io/bouskaj/operator-vind-snapshot
 
 jobs:
   build-operator:
