@@ -15,35 +15,42 @@ import (
 	"time"
 
 	. "github.com/onsi/gomega"
-	"github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/labels"
+	rhtasv1 "github.com/securesign/operator/api/v1"
 	tsaUtils "github.com/securesign/operator/internal/controller/tsa/utils"
+	"github.com/securesign/operator/internal/labels"
 	"github.com/securesign/operator/test/e2e/support"
 	"github.com/securesign/operator/test/e2e/support/condition"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func Verify(ctx context.Context, cli client.Client, namespace string, name string) {
-	Eventually(Get(ctx, cli, namespace, name)).Should(
-		WithTransform(condition.IsReady, BeTrue()))
+	Eventually(Get).WithContext(ctx).
+		WithArguments(cli, namespace, name).
+		Should(
+			And(
+				Not(BeNil()),
+				WithTransform(condition.IsReady, BeTrue()),
+			))
 
 	// server
-	Eventually(condition.DeploymentIsRunning(ctx, cli, namespace, "timestamp-authority")).
+	Eventually(condition.DeploymentIsRunning).WithContext(ctx).
+		WithArguments(cli, namespace, "timestamp-authority").
 		Should(BeTrue())
 }
 
-func Get(ctx context.Context, cli client.Client, ns string, name string) func() *v1alpha1.TimestampAuthority {
-	return func() *v1alpha1.TimestampAuthority {
-		instance := &v1alpha1.TimestampAuthority{}
-		_ = cli.Get(ctx, types.NamespacedName{
-			Namespace: ns,
-			Name:      name,
-		}, instance)
-		return instance
+func Get(ctx context.Context, cli client.Client, ns string, name string) *rhtasv1.TimestampAuthority {
+	instance := &rhtasv1.TimestampAuthority{}
+	if e := cli.Get(ctx, types.NamespacedName{
+		Namespace: ns,
+		Name:      name,
+	}, instance); errors.IsNotFound(e) {
+		return nil
 	}
+	return instance
 }
 
 func GetServerPod(ctx context.Context, cli client.Client, ns string) func() *v1.Pod {
@@ -57,7 +64,7 @@ func GetServerPod(ctx context.Context, cli client.Client, ns string) func() *v1.
 	}
 }
 
-func GetCertificateChain(ctx context.Context, cli client.Client, ns string, name string, url string) error {
+func GetCertificateChain(ctx context.Context, url string) error {
 	var resp *http.Response
 	var err error
 	req, err := http.NewRequestWithContext(ctx, "GET", url+"/api/v1/timestamp/certchain", nil)
@@ -91,26 +98,22 @@ func GetCertificateChain(ctx context.Context, cli client.Client, ns string, name
 	return nil
 }
 
-func CreateSecrets(ns string, name string) *v1.Secret {
+func CreateSecrets(ns string, name string, passwordProtected bool) *v1.Secret {
 
-	config := &tsaUtils.TsaCertChainConfig{
-		RootPrivateKeyPassword:          []byte(support.CertPassword),
-		IntermediatePrivateKeyPasswords: [][]byte{[]byte(support.CertPassword)},
-		LeafPrivateKeyPassword:          []byte(support.CertPassword),
-	}
-	_, rootPrivateKey, rootCA, err := support.CreateCertificates(true)
+	config := &tsaUtils.TsaCertChainConfig{}
+	_, rootPrivateKey, rootCA, err := support.CreateCertificates(passwordProtected)
 	if err != nil {
 		return nil
 	}
 	config.RootPrivateKey = rootPrivateKey
 
-	intermediatePublicKey, intermediatePrivateKey, _, err := support.CreateCertificates(true)
+	intermediatePublicKey, intermediatePrivateKey, _, err := support.CreateCertificates(passwordProtected)
 	if err != nil {
 		return nil
 	}
 	config.IntermediatePrivateKeys = append(config.IntermediatePrivateKeys, intermediatePrivateKey)
 
-	leafPublicKey, leafPrivateKey, _, err := support.CreateCertificates(true)
+	leafPublicKey, leafPrivateKey, _, err := support.CreateCertificates(passwordProtected)
 	if err != nil {
 		return nil
 	}
@@ -118,21 +121,20 @@ func CreateSecrets(ns string, name string) *v1.Secret {
 
 	block, _ := pem.Decode(rootPrivateKey)
 	keyBytes := block.Bytes
+	// Decrypt the encrypted test key to use it for signing intermediate/leaf certs.
 	if x509.IsEncryptedPEMBlock(block) { //nolint:staticcheck
 		keyBytes, err = x509.DecryptPEMBlock(block, []byte(support.CertPassword)) //nolint:staticcheck
 		if err != nil {
 			return nil
 		}
 	}
-
 	rootPrivKey, err := x509.ParseECPrivateKey(keyBytes)
 	if err != nil {
 		return nil
 	}
 
 	block, _ = pem.Decode(intermediatePublicKey)
-	keyBytes = block.Bytes
-	interPubKey, err := x509.ParsePKIXPublicKey(keyBytes)
+	interPubKey, err := x509.ParsePKIXPublicKey(block.Bytes)
 	if err != nil {
 		return nil
 	}
@@ -149,8 +151,7 @@ func CreateSecrets(ns string, name string) *v1.Secret {
 	}
 
 	block, _ = pem.Decode(leafPublicKey)
-	keyBytes = block.Bytes
-	leafPuKey, err := x509.ParsePKIXPublicKey(keyBytes)
+	leafPuKey, err := x509.ParsePKIXPublicKey(block.Bytes)
 	if err != nil {
 		return nil
 	}
@@ -173,21 +174,24 @@ func CreateSecrets(ns string, name string) *v1.Secret {
 	certificateChain = append(certificateChain, rootCA...)
 	config.CertificateChain = certificateChain
 
-	return &v1.Secret{
+	s := &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: ns,
 		},
 		Data: map[string][]byte{
-			"rootPrivateKey":            config.RootPrivateKey,
-			"rootPrivateKeyPassword":    config.RootPrivateKeyPassword,
-			"interPrivateKey-0":         config.IntermediatePrivateKeys[0],
-			"interPrivateKeyPassword-0": config.IntermediatePrivateKeyPasswords[0],
-			"leafPrivateKey":            config.LeafPrivateKey,
-			"leafPrivateKeyPassword":    config.LeafPrivateKeyPassword,
-			"certificateChain":          config.CertificateChain,
+			"rootPrivateKey":    config.RootPrivateKey,
+			"interPrivateKey-0": config.IntermediatePrivateKeys[0],
+			"leafPrivateKey":    config.LeafPrivateKey,
+			"certificateChain":  config.CertificateChain,
 		},
 	}
+	if passwordProtected {
+		s.Data["rootPrivateKeyPassword"] = []byte(support.CertPassword)
+		s.Data["interPrivateKeyPassword-0"] = []byte(support.CertPassword)
+		s.Data["leafPrivateKeyPassword"] = []byte(support.CertPassword)
+	}
+	return s
 }
 
 func getCertTemplate(isCA bool) *x509.Certificate {

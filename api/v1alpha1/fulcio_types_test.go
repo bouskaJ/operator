@@ -1,9 +1,11 @@
 package v1alpha1
 
 import (
+	"context"
+	"math"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"golang.org/x/net/context"
 	_ "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -73,6 +75,21 @@ var _ = Describe("Fulcio", func() {
 				Expect(k8sClient.Update(context.Background(), fetched)).
 					To(MatchError(ContainSubstring("Feature cannot be disabled")))
 			})
+
+			It("edit RouteSelectorLabel", func() {
+				created := generateFulcioObject("fulcio-access-3")
+				created.Spec.ExternalAccess.RouteSelectorLabels = map[string]string{"test": "fake", "foo": "bar"}
+				Expect(k8sClient.Create(context.Background(), created)).To(Succeed())
+
+				fetched := &Fulcio{}
+				Expect(k8sClient.Get(context.Background(), getKey(created), fetched)).To(Succeed())
+				Expect(fetched).To(Equal(created))
+
+				fetched.Spec.ExternalAccess.RouteSelectorLabels = map[string]string{"test": "test", "foo": "bar"}
+				Expect(apierrors.IsInvalid(k8sClient.Update(context.Background(), fetched))).To(BeTrue())
+				Expect(k8sClient.Update(context.Background(), fetched)).
+					To(MatchError(ContainSubstring("RouteSelectorLabels can't be modified")))
+			})
 		})
 
 		When("changing monitoring", func() {
@@ -122,10 +139,22 @@ var _ = Describe("Fulcio", func() {
 				invalidObject := generateFulcioObject("config-invalid")
 				invalidObject.Spec.Config.OIDCIssuers = []OIDCIssuer{}
 				invalidObject.Spec.Config.MetaIssuers = []OIDCIssuer{}
+				// CIIssuerMetadata is allowed to be empty
 
 				Expect(apierrors.IsInvalid(k8sClient.Create(context.Background(), invalidObject))).To(BeTrue())
 				Expect(k8sClient.Create(context.Background(), invalidObject)).
 					To(MatchError(ContainSubstring("At least one of OIDCIssuers or MetaIssuers must be defined")))
+			})
+
+			It("CIIssuerMetadata is set", func() {
+				validObject := generateFulcioObject("config-ci-issuer-metadata")
+				addCIIssuerMetadata(validObject)
+
+				Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+
+				fetched := &Fulcio{}
+				Expect(k8sClient.Get(context.Background(), getKey(validObject), fetched)).To(Succeed())
+				Expect(fetched).To(Equal(validObject))
 			})
 
 			It("only MetaIssuer is set", func() {
@@ -163,6 +192,34 @@ var _ = Describe("Fulcio", func() {
 				Expect(apierrors.IsInvalid(k8sClient.Create(context.Background(), invalidObject))).To(BeTrue())
 				Expect(k8sClient.Create(context.Background(), invalidObject)).
 					To(MatchError(ContainSubstring("spec.ctlog.prefix in body should match")))
+			})
+
+			When("replicas", func() {
+				It("nil", func() {
+					validObject := generateFulcioObject("replicas-nil")
+					validObject.Spec.Replicas = nil
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+				})
+
+				It("positive", func() {
+					validObject := generateFulcioObject("replicas-positive")
+					validObject.Spec.Replicas = ptr.To(int32(math.MaxInt32))
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+				})
+
+				It("negative", func() {
+					invalidObject := generateFulcioObject("replicas-negative")
+					invalidObject.Spec.Replicas = ptr.To(int32(-1))
+					Expect(apierrors.IsInvalid(k8sClient.Create(context.Background(), invalidObject))).To(BeTrue())
+					Expect(k8sClient.Create(context.Background(), invalidObject)).
+						To(MatchError(ContainSubstring("spec.replicas in body should be greater than or equal to 0")))
+				})
+
+				It("zero", func() {
+					validObject := generateFulcioObject("replicas-zero")
+					validObject.Spec.Replicas = ptr.To(int32(0))
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+				})
 			})
 		})
 
@@ -254,13 +311,24 @@ func generateFulcioObject(name string) *Fulcio {
 			Namespace: "default",
 		},
 		Spec: FulcioSpec{
+			PodRequirements: PodRequirements{
+				Replicas: ptr.To(int32(1)),
+			},
 			Config: FulcioConfig{
 				OIDCIssuers: []OIDCIssuer{
 					{
-						ClientID:  "client",
-						Type:      "email",
-						IssuerURL: "url",
-						Issuer:    "url",
+						ClientID:   "client",
+						Type:       "email",
+						IssuerURL:  "url",
+						Issuer:     "url",
+						CIProvider: "foo",
+					},
+					{
+						ClientID:   "ci-client",
+						Type:       "ci-provider",
+						CIProvider: "foo",
+						IssuerURL:  "url",
+						Issuer:     "url",
 					},
 				},
 				MetaIssuers: []OIDCIssuer{
@@ -288,4 +356,31 @@ func generateFulcioObject(name string) *Fulcio {
 			},
 		},
 	}
+}
+
+func addCIIssuerMetadata(config *Fulcio) *Fulcio {
+	config.Spec.Config.CIIssuerMetadata = []CIIssuerMetadata{
+		{
+			IssuerName:                     "gitlab-ci",
+			DefaultTemplateValues:          map[string]string{"url": "https://gitlab.com"},
+			SubjectAlternativeNameTemplate: "https://{{ .ci_config_ref_uri }}",
+			ExtensionTemplates: Extensions{
+				BuildSignerURI:                      "https://{{ .ci_config_ref_uri }}",
+				BuildSignerDigest:                   "ci_config_sha",
+				RunnerEnvironment:                   "runner_environment",
+				SourceRepositoryURI:                 "{{ .url }}/{{ .project_path }}",
+				SourceRepositoryDigest:              "sha",
+				SourceRepositoryRef:                 "refs/{{if eq .ref_type \"branch\"}}heads/{{ else }}tags/{{end}}{{ .ref }}",
+				SourceRepositoryIdentifier:          "project_id",
+				SourceRepositoryOwnerURI:            "{{ .url }}/{{ .namespace_path }}",
+				SourceRepositoryOwnerIdentifier:     "namespace_id",
+				BuildConfigURI:                      "https://{{ .ci_config_ref_uri }}",
+				BuildConfigDigest:                   "ci_config_sha",
+				BuildTrigger:                        "pipeline_source",
+				RunInvocationURI:                    "{{ .url }}/{{ .project_path }}/-/jobs/{{ .job_id }}",
+				SourceRepositoryVisibilityAtSigning: "project_visibility",
+			},
+		},
+	}
+	return config
 }

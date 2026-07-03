@@ -1,3 +1,19 @@
+/*
+Copyright 2023.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package v1alpha1
 
 import (
@@ -5,13 +21,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
-
 // CTlogSpec defines the desired state of CTlog component
 // +kubebuilder:validation:XValidation:rule=(!has(self.publicKeyRef) || has(self.privateKeyRef)),message=privateKeyRef cannot be empty
 // +kubebuilder:validation:XValidation:rule=(!has(self.privateKeyPasswordRef) || has(self.privateKeyRef)),message=privateKeyRef cannot be empty
 type CTlogSpec struct {
+	PodRequirements `json:",inline"`
 	// The ID of a Trillian tree that stores the log data.
 	// If it is unset, the operator will create new Merkle tree in the Trillian backend
 	//+optional
@@ -37,7 +51,7 @@ type CTlogSpec struct {
 	RootCertificates []SecretKeySelector `json:"rootCertificates,omitempty"`
 
 	//Enable Service monitors for ctlog
-	Monitoring MonitoringConfig `json:"monitoring,omitempty"`
+	Monitoring MonitoringWithTLogConfig `json:"monitoring,omitempty"`
 
 	// Trillian service configuration
 	//+kubebuilder:default:={port: 8091}
@@ -48,6 +62,15 @@ type CTlogSpec struct {
 	// publicKeyRef, rootCertificates and trillian will be overridden.
 	//+optional
 	ServerConfigRef *LocalObjectReference `json:"serverConfigRef,omitempty"`
+
+	// Configuration for enabling TLS (Transport Layer Security) encryption for manged service.
+	//+optional
+	TLS TLS `json:"tls,omitempty"`
+
+	// Max certificate chain size in bytes. Passed as --max_cert_chain_size.
+	//+kubebuilder:default:=153600
+	//+optional
+	MaxCertChainSize *int64 `json:"maxCertChainSize,omitempty"`
 }
 
 // CTlogStatus defines the observed state of CTlog component
@@ -60,6 +83,10 @@ type CTlogStatus struct {
 	// The ID of a Trillian tree that stores the log data.
 	// +kubebuilder:validation:Type=number
 	TreeID *int64 `json:"treeID,omitempty"`
+	// Configuration for enabling TLS (Transport Layer Security) encryption for manged service.
+	//+optional
+	TLS TLS    `json:"tls,omitempty"`
+	Url string `json:"url,omitempty"`
 	// +listType=map
 	// +listMapKey=type
 	// +patchStrategy=merge
@@ -90,14 +117,24 @@ type CTlogList struct {
 	Items           []CTlog `json:"items"`
 }
 
-func init() {
-	SchemeBuilder.Register(&CTlog{}, &CTlogList{})
-}
-
 func (i *CTlog) GetConditions() []metav1.Condition {
 	return i.Status.Conditions
 }
 
 func (i *CTlog) SetCondition(newCondition metav1.Condition) {
 	meta.SetStatusCondition(&i.Status.Conditions, newCondition)
+}
+
+func (i *CTlog) GetTrustedCA() *LocalObjectReference {
+	if v, ok := i.GetAnnotations()["rhtas.redhat.com/trusted-ca"]; ok {
+		return &LocalObjectReference{
+			Name: v,
+		}
+	}
+
+	return nil
+}
+
+func (i *CTlog) GetServiceURL() string {
+	return i.Status.Url
 }

@@ -1,9 +1,10 @@
 package v1alpha1
 
 import (
+	"context"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"golang.org/x/net/context"
 	_ "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	k8sresource "k8s.io/apimachinery/pkg/api/resource"
@@ -72,6 +73,21 @@ var _ = Describe("Rekor", func() {
 				Expect(k8sClient.Update(context.Background(), fetched)).
 					To(MatchError(ContainSubstring("Feature cannot be disabled")))
 			})
+
+			It("edit RouteSelectorLabel", func() {
+				created := generateRekorObject("rekor-access-3")
+				created.Spec.ExternalAccess.RouteSelectorLabels = map[string]string{"test": "fake", "foo": "bar"}
+				Expect(k8sClient.Create(context.Background(), created)).To(Succeed())
+
+				fetched := &Rekor{}
+				Expect(k8sClient.Get(context.Background(), getKey(created), fetched)).To(Succeed())
+				Expect(fetched).To(Equal(created))
+
+				fetched.Spec.ExternalAccess.RouteSelectorLabels = map[string]string{"test": "test", "foo": "bar"}
+				Expect(apierrors.IsInvalid(k8sClient.Update(context.Background(), fetched))).To(BeTrue())
+				Expect(k8sClient.Update(context.Background(), fetched)).
+					To(MatchError(ContainSubstring("RouteSelectorLabels can't be modified")))
+			})
 		})
 
 		When("changing Rekor Search UI", func() {
@@ -128,6 +144,36 @@ var _ = Describe("Rekor", func() {
 				Expect(fetched).To(Equal(created))
 
 				fetched.Spec.Monitoring.Enabled = false
+				Expect(apierrors.IsInvalid(k8sClient.Update(context.Background(), fetched))).To(BeTrue())
+				Expect(k8sClient.Update(context.Background(), fetched)).
+					To(MatchError(ContainSubstring("Feature cannot be disabled")))
+			})
+		})
+
+		When("changing tlog monitoring setting", func() {
+			It("enabled false->true", func() {
+				created := generateRekorObject("rekor-tlog-monitoring-1")
+				created.Spec.Monitoring.TLog.Enabled = false
+				Expect(k8sClient.Create(context.Background(), created)).To(Succeed())
+
+				fetched := &Rekor{}
+				Expect(k8sClient.Get(context.Background(), getKey(created), fetched)).To(Succeed())
+				Expect(fetched).To(Equal(created))
+
+				fetched.Spec.Monitoring.TLog.Enabled = true
+				Expect(k8sClient.Update(context.Background(), fetched)).To(Succeed())
+			})
+
+			It("enabled true->false", func() {
+				created := generateRekorObject("rekor-tlog-monitoring-2")
+				created.Spec.Monitoring.TLog.Enabled = true
+				Expect(k8sClient.Create(context.Background(), created)).To(Succeed())
+
+				fetched := &Rekor{}
+				Expect(k8sClient.Get(context.Background(), getKey(created), fetched)).To(Succeed())
+				Expect(fetched).To(Equal(created))
+
+				fetched.Spec.Monitoring.TLog.Enabled = false
 				Expect(apierrors.IsInvalid(k8sClient.Update(context.Background(), fetched))).To(BeTrue())
 				Expect(k8sClient.Update(context.Background(), fetched)).
 					To(MatchError(ContainSubstring("Feature cannot be disabled")))
@@ -228,6 +274,324 @@ var _ = Describe("Rekor", func() {
 			})
 		})
 
+		Context("search index", func() {
+			It("invalid provider", func() {
+				invalidObject := generateRekorObject("search-invalid-provider")
+				invalidObject.Spec.SearchIndex.Provider = "invalid"
+				Expect(apierrors.IsInvalid(k8sClient.Create(context.Background(), invalidObject))).To(BeTrue())
+				Expect(k8sClient.Create(context.Background(), invalidObject)).
+					To(MatchError(ContainSubstring("Unsupported value: \"invalid\"")))
+			})
+
+			It("immutable create", func() {
+				validObject := generateRekorObject("search-immutable-create")
+				Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+
+				invalidObject := &Rekor{}
+				Expect(k8sClient.Get(context.Background(), getKey(validObject), invalidObject)).To(Succeed())
+				invalidObject.Spec.SearchIndex.Create = ptr.To(false)
+
+				Expect(apierrors.IsInvalid(k8sClient.Update(context.Background(), invalidObject))).To(BeTrue())
+				Expect(k8sClient.Update(context.Background(), invalidObject)).
+					To(MatchError(ContainSubstring("Field is immutable")))
+			})
+
+			It("provider specified with crate=true", func() {
+				invalidObject := generateRekorObject("provider-specified-crate")
+				invalidObject.Spec.SearchIndex.Provider = "redis" //nolint:goconst
+				invalidObject.Spec.SearchIndex.Url = "fake"
+				invalidObject.Spec.SearchIndex.Create = ptr.To(true)
+				Expect(apierrors.IsInvalid(k8sClient.Create(context.Background(), invalidObject))).To(BeTrue())
+				Expect(k8sClient.Create(context.Background(), invalidObject)).
+					To(MatchError(ContainSubstring("Provider can be specified only with external db (create=false)")))
+			})
+
+			It("no provider specified with crate=false", func() {
+				invalidObject := generateRekorObject("provider-not-specified-nocrate")
+				invalidObject.Spec.SearchIndex.Create = ptr.To(false)
+				Expect(apierrors.IsInvalid(k8sClient.Create(context.Background(), invalidObject))).To(BeTrue())
+				Expect(k8sClient.Create(context.Background(), invalidObject)).
+					To(MatchError(ContainSubstring("Provider must be defined with external db (create=false)")))
+			})
+
+			It("empty url with provider", func() {
+				invalidObject := generateRekorObject("empty-url")
+				invalidObject.Spec.SearchIndex.Provider = "redis" //nolint:goconst
+				invalidObject.Spec.SearchIndex.Create = ptr.To(false)
+				Expect(apierrors.IsInvalid(k8sClient.Create(context.Background(), invalidObject))).To(BeTrue())
+				Expect(k8sClient.Create(context.Background(), invalidObject)).
+					To(MatchError(ContainSubstring("URL must be provided if provider is specified")))
+			})
+
+			It("external redis provider", func() {
+				validObject := generateRekorObject("search-external-redis")
+				validObject.Spec.SearchIndex.Provider = "redis" //nolint:goconst
+				validObject.Spec.SearchIndex.Url = "redis://rekor-redis:6379"
+				validObject.Spec.SearchIndex.Create = ptr.To(false)
+				Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+			})
+
+			It("external rediss provider", func() {
+				validObject := generateRekorObject("search-external-rediss")
+				validObject.Spec.SearchIndex.Provider = "redis"
+				validObject.Spec.SearchIndex.Url = "rediss://rekor-redis:6379"
+				validObject.Spec.SearchIndex.Create = ptr.To(false)
+				Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+			})
+
+			It("external mysql provider", func() {
+				validObject := generateRekorObject("search-external-mysql")
+				validObject.Spec.SearchIndex.Provider = "mysql"
+				validObject.Spec.SearchIndex.Url = "mysql://mysql:6379"
+				validObject.Spec.SearchIndex.Create = ptr.To(false)
+				Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+			})
+		})
+
+		Context("signer validation", func() {
+			When("using valid KMS values", func() {
+				It("should allow empty string", func() {
+					validObject := generateRekorObject("rekor-kms-valid-empty")
+					validObject.Spec.Signer.KMS = ""
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+				})
+
+				It("should allow 'secret'", func() {
+					validObject := generateRekorObject("rekor-kms-valid-secret")
+					validObject.Spec.Signer.KMS = "secret"
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+				})
+
+				It("should allow 'memory'", func() {
+					validObject := generateRekorObject("rekor-kms-valid-memory")
+					validObject.Spec.Signer.KMS = "memory"
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+				})
+
+				It("should allow 'awskms://' URI", func() {
+					validObject := generateRekorObject("rekor-kms-valid-aws")
+					validObject.Spec.Signer.KMS = "awskms://key/arn"
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+				})
+
+				It("should allow 'awskms:///' URI (triple slash)", func() {
+					validObject := generateRekorObject("rekor-kms-valid-aws-tripleslash")
+					validObject.Spec.Signer.KMS = "awskms:///key-id-or-arn"
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+				})
+
+				It("should allow 'gcpkms://' URI", func() {
+					validObject := generateRekorObject("rekor-kms-valid-gcp")
+					validObject.Spec.Signer.KMS = "gcpkms://key/path"
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+				})
+
+				It("should allow 'azurekms://' URI", func() {
+					validObject := generateRekorObject("rekor-kms-valid-azure")
+					validObject.Spec.Signer.KMS = "azurekms://key/path"
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+				})
+
+				It("should allow 'hashivault://' URI", func() {
+					validObject := generateRekorObject("rekor-kms-valid-vault")
+					validObject.Spec.Signer.KMS = "hashivault://key/path"
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+				})
+			})
+
+			When("using invalid KMS values", func() {
+				It("should reject a random string", func() {
+					invalidObject := generateRekorObject("rekor-kms-invalid-random")
+					invalidObject.Spec.Signer.KMS = "unsupported"
+
+					Expect(apierrors.IsInvalid(k8sClient.Create(context.Background(), invalidObject))).To(BeTrue())
+					Expect(k8sClient.Create(context.Background(), invalidObject)).
+						To(MatchError(ContainSubstring("KMS must be '', 'secret', 'memory', or a valid URI")))
+				})
+
+				It("should reject an incomplete URI", func() {
+					invalidObject := generateRekorObject("rekor-kms-invalid-incomplete")
+					invalidObject.Spec.Signer.KMS = "awskms://"
+
+					Expect(apierrors.IsInvalid(k8sClient.Create(context.Background(), invalidObject))).To(BeTrue())
+					Expect(k8sClient.Create(context.Background(), invalidObject)).
+						To(MatchError(ContainSubstring("KMS must be '', 'secret', 'memory', or a valid URI")))
+				})
+
+				It("should reject a typo URI", func() {
+					invalidObject := generateRekorObject("rekor-kms-invalid-typo")
+					invalidObject.Spec.Signer.KMS = "aws-kms://key"
+
+					Expect(apierrors.IsInvalid(k8sClient.Create(context.Background(), invalidObject))).To(BeTrue())
+					Expect(k8sClient.Create(context.Background(), invalidObject)).
+						To(MatchError(ContainSubstring("KMS must be '', 'secret', 'memory', or a valid URI")))
+				})
+
+				It("should reject unsupported protocol", func() {
+					invalidObject := generateRekorObject("rekor-kms-invalid-other")
+					invalidObject.Spec.Signer.KMS = "s3://my-bucket"
+
+					Expect(apierrors.IsInvalid(k8sClient.Create(context.Background(), invalidObject))).To(BeTrue())
+					Expect(k8sClient.Create(context.Background(), invalidObject)).
+						To(MatchError(ContainSubstring("KMS must be '', 'secret', 'memory', or a valid URI")))
+				})
+			})
+		})
+
+		Context("attestations", func() {
+			When("file url", func() {
+				It("default", func() {
+					validObject := generateRekorObject("attestation-file-default")
+					validObject.Spec.Attestations.Url = "file:///var/run/attestations?no_tmp_dir=true"
+
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+				})
+
+				It("without argument", func() {
+					validObject := generateRekorObject("attestation-file-without-args")
+					validObject.Spec.Attestations.Url = "file:///var/run/attestations"
+
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+				})
+
+				It("incorrect path", func() {
+					invalidObject := generateRekorObject("incorrect-path")
+					invalidObject.Spec.Attestations.Url = "file://my/custom/path"
+
+					Expect(apierrors.IsInvalid(k8sClient.Create(context.Background(), invalidObject))).To(BeTrue())
+					Expect(k8sClient.Create(context.Background(), invalidObject)).
+						To(MatchError(ContainSubstring("If using 'file://' protocol, the URL must start with 'file:///var/run/attestations'.")))
+				})
+			})
+
+			When("other provider", func() {
+				It("mem", func() {
+					validObject := generateRekorObject("attestation-mem")
+					validObject.Spec.Attestations.Url = "mem://"
+
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+				})
+
+				It("s3", func() {
+					validObject := generateRekorObject("attestation-s3")
+					validObject.Spec.Attestations.Url = "s3://my-bucket?endpoint=my.minio.local:8080&s3ForcePathStyle=true"
+
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+				})
+			})
+
+			When("is validated", func() {
+				It("cannot be disabled", func() {
+					validObject := generateRekorObject("immutable-attestation")
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+
+					invalidObject := &Rekor{}
+					Expect(k8sClient.Get(context.Background(), getKey(validObject), invalidObject)).To(Succeed())
+					invalidObject.Spec.Attestations.Enabled = ptr.To(false)
+
+					Expect(apierrors.IsInvalid(k8sClient.Update(context.Background(), invalidObject))).To(BeTrue())
+					Expect(k8sClient.Update(context.Background(), invalidObject)).
+						To(MatchError(ContainSubstring("Feature cannot be disabled once enabled.")))
+				})
+
+				It("unsupported protocol", func() {
+					invalidObject := generateRekorObject("unsupported-protocol")
+					invalidObject.Spec.Attestations.Url = "fake://fake"
+
+					Expect(apierrors.IsInvalid(k8sClient.Create(context.Background(), invalidObject))).To(BeTrue())
+					Expect(k8sClient.Create(context.Background(), invalidObject)).
+						To(MatchError(ContainSubstring("URL must use a supported protocol")))
+				})
+			})
+		})
+
+		DescribeTable("replicas conditions",
+			func(replicas *int32, attestationEnabled *bool, attestationUrl string, pvcAccessModes []PersistentVolumeAccessMode, isValid bool) {
+				object := generateRekorObject("")
+				object.GenerateName = "replicas-conditions-"
+				object.Spec.Replicas = replicas
+				object.Spec.Attestations.Enabled = attestationEnabled
+				object.Spec.Attestations.Url = attestationUrl
+				object.Spec.Pvc.AccessModes = pvcAccessModes
+
+				if isValid {
+					Expect(k8sClient.Create(context.Background(), object)).To(Succeed())
+				} else {
+					Expect(k8sClient.Create(context.Background(), object)).To(MatchError(ContainSubstring("'ReadWriteMany' for replicas greater than 1")))
+				}
+
+			},
+			Entry(nil, nil, nil, "mem://", []PersistentVolumeAccessMode{"ReadWriteOnce"}, true),
+			Entry(nil, nil, nil, "file:///var/run/attestations", []PersistentVolumeAccessMode{"ReadWriteOnce"}, true),
+			Entry(nil, nil, ptr.To(true), "file:///var/run/attestations", []PersistentVolumeAccessMode{}, true),
+			Entry(nil, nil, ptr.To(true), "mem://", []PersistentVolumeAccessMode{"ReadWriteOnce", "ReadWriteMany"}, true),
+			Entry(nil, nil, ptr.To(false), "file:///var/run/attestations", []PersistentVolumeAccessMode{"ReadWriteMany"}, true),
+
+			Entry(nil, ptr.To(int32(0)), ptr.To(false), "file:///var/run/attestations", []PersistentVolumeAccessMode{"ReadWriteOnce", "ReadWriteMany"}, true),
+			Entry(nil, ptr.To(int32(0)), nil, "mem://", []PersistentVolumeAccessMode{}, true),
+			Entry(nil, ptr.To(int32(0)), ptr.To(true), "mem://", []PersistentVolumeAccessMode{"ReadWriteOnce"}, true),
+			Entry(nil, ptr.To(int32(0)), nil, "file:///var/run/attestations", []PersistentVolumeAccessMode{"ReadWriteMany"}, true),
+
+			Entry(nil, ptr.To(int32(1)), ptr.To(false), "mem://", []PersistentVolumeAccessMode{"ReadWriteOnce"}, true),
+			Entry(nil, ptr.To(int32(1)), ptr.To(true), "file:///var/run/attestations", []PersistentVolumeAccessMode{"ReadWriteMany"}, true),
+			Entry(nil, ptr.To(int32(1)), nil, "file:///var/run/attestations", []PersistentVolumeAccessMode{}, true),
+			Entry(nil, ptr.To(int32(1)), nil, "file:///var/run/attestations", []PersistentVolumeAccessMode{"ReadWriteOnce", "ReadWriteMany"}, true),
+
+			Entry(nil, ptr.To(int32(2)), ptr.To(true), "file:///var/run/attestations", []PersistentVolumeAccessMode{"ReadWriteOnce", "ReadWriteMany"}, true),
+			Entry(nil, ptr.To(int32(2)), nil, "mem://", []PersistentVolumeAccessMode{"ReadWriteMany"}, true),
+			Entry(nil, ptr.To(int32(2)), ptr.To(false), "mem://", []PersistentVolumeAccessMode{}, true),
+			Entry(nil, ptr.To(int32(2)), ptr.To(true), "mem://", []PersistentVolumeAccessMode{"ReadWriteOnce", "ReadWriteMany"}, true),
+
+			// not valid scenarios
+			Entry(nil, ptr.To(int32(2)), ptr.To(true), "file:///var/run/attestations", []PersistentVolumeAccessMode{"ReadWriteOnce"}, false),
+			Entry(nil, ptr.To(int32(2)), nil, "file:///var/run/attestations", []PersistentVolumeAccessMode{"ReadWriteOnce"}, false),
+			Entry(nil, ptr.To(int32(2)), ptr.To(true), "file:///var/run/attestations", []PersistentVolumeAccessMode{}, false),
+		)
+
+		type pvcArgs struct {
+			name         string
+			storageClass string
+			accessModes  []PersistentVolumeAccessMode
+		}
+		DescribeTable("pvc", func(ctx context.Context, origObj pvcArgs, updateObj *pvcArgs, isValid bool, errMessage string) {
+			object := generateRekorObject("")
+			object.GenerateName = "rekor-pvc-"
+			object.Spec.Pvc.Name = origObj.name
+			object.Spec.Pvc.StorageClass = origObj.storageClass
+			object.Spec.Pvc.AccessModes = origObj.accessModes
+
+			err := k8sClient.Create(ctx, object)
+			if updateObj == nil && !isValid {
+				Expect(err).To(MatchError(ContainSubstring(errMessage)))
+				return
+			}
+			Expect(err).To(Succeed())
+			if updateObj == nil {
+				return
+			}
+
+			object.Spec.Pvc.Name = updateObj.name
+			object.Spec.Pvc.StorageClass = updateObj.storageClass
+			object.Spec.Pvc.AccessModes = updateObj.accessModes
+
+			if isValid {
+				Expect(k8sClient.Update(ctx, object)).To(Succeed())
+			} else {
+				Expect(k8sClient.Update(ctx, object)).To(MatchError(ContainSubstring(errMessage)))
+			}
+		},
+			Entry("create default", pvcArgs{}, nil, true, ""),
+			Entry("bring your own pvc", pvcArgs{name: "byo-pvc"}, nil, true, ""),
+			Entry("change name", pvcArgs{}, &pvcArgs{name: "new"}, true, ""),
+			Entry("no changes", pvcArgs{storageClass: "default", accessModes: []PersistentVolumeAccessMode{"ReadWriteOnce"}}, &pvcArgs{storageClass: "default", accessModes: []PersistentVolumeAccessMode{"ReadWriteOnce"}}, true, ""),
+			Entry("immutable storageClass", pvcArgs{storageClass: "default"}, &pvcArgs{storageClass: "new"}, false, "storageClass is immutable"),
+			Entry("change storageClass when name is set", pvcArgs{name: "named", storageClass: "old"}, &pvcArgs{name: "named", storageClass: "new"}, true, ""),
+			Entry("change storageClass and name", pvcArgs{storageClass: "old"}, &pvcArgs{name: "new", storageClass: "new"}, true, ""),
+			Entry("immutable accessModes", pvcArgs{accessModes: []PersistentVolumeAccessMode{"ReadWriteOnce"}}, &pvcArgs{accessModes: []PersistentVolumeAccessMode{"ReadWriteMany"}}, false, "accessModes is immutable"),
+			Entry("change accessModes when name is set", pvcArgs{name: "named", accessModes: []PersistentVolumeAccessMode{"ReadWriteOnce"}}, &pvcArgs{name: "named", accessModes: []PersistentVolumeAccessMode{"ReadWriteOnce", "ReadWriteMany"}}, true, ""),
+			Entry("change accessModes and name", pvcArgs{accessModes: []PersistentVolumeAccessMode{"ReadWriteOnce"}}, &pvcArgs{name: "new", accessModes: []PersistentVolumeAccessMode{"ReadWriteOnce", "ReadWriteMany"}}, true, ""),
+		)
+
 		Context("Default settings", func() {
 			var (
 				rekorInstance         Rekor
@@ -253,6 +617,7 @@ var _ = Describe("Rekor", func() {
 					Expect(fetched.Spec.Pvc.Name).To(Equal(expectedRekorInstance.Spec.Pvc.Name))
 					Expect(fetched.Spec.Pvc.Size).To(Equal(expectedRekorInstance.Spec.Pvc.Size))
 					Expect(*fetched.Spec.RekorSearchUI.Enabled).To(BeTrue())
+					Expect(*fetched.Spec.SearchIndex.Create).To(BeTrue())
 				})
 			})
 
@@ -268,8 +633,13 @@ var _ = Describe("Rekor", func() {
 							Namespace: "default",
 						},
 						Spec: RekorSpec{
-							Monitoring: MonitoringConfig{
-								Enabled: true,
+							Monitoring: MonitoringWithTLogConfig{
+								MonitoringConfig: MonitoringConfig{
+									Enabled: true,
+								},
+								TLog: TlogMonitoring{
+									Enabled: true,
+								},
 							},
 							ExternalAccess: ExternalAccess{
 								Enabled: true,
@@ -315,6 +685,9 @@ var _ = Describe("Rekor", func() {
 									EncodedPublicKey: "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUZrd0V3WUhLb1pJemowQ0FRWUlLb1pJemowREFRY0RRZ0FFWkZ0Nk5FcU14YWVVNzZsbmxZekZVTmpGUUdIcQpORjQ2QlBDVGxQL0ZnZk1aak42MDhjRFhmM0xNNWhUYnZOeUNFYWJFKzRNYk9jRU1YaERRVWxZRnZBPT0KLS0tLS1FTkQgUFVCTElDIEtFWS0tLS0tCg==",
 								},
 							},
+							SearchIndex: SearchIndex{
+								Create: ptr.To(true),
+							},
 						},
 					}
 
@@ -356,6 +729,7 @@ var _ = Describe("Rekor", func() {
 
 func generateRekorObject(name string) *Rekor {
 	storage := k8sresource.MustParse("5Gi")
+	maxSize := k8sresource.MustParse("100Ki")
 	return &Rekor{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -369,6 +743,11 @@ func generateRekorObject(name string) *Rekor {
 			Signer: RekorSigner{
 				KMS: "secret",
 			},
+			Attestations: RekorAttestations{
+				Enabled: ptr.To(true),
+				Url:     "file:///var/run/attestations?no_tmp_dir=true",
+				MaxSize: &maxSize,
+			},
 			Pvc: Pvc{
 				Retain: ptr.To(true),
 				Size:   &storage,
@@ -379,6 +758,7 @@ func generateRekorObject(name string) *Rekor {
 			Trillian: TrillianService{
 				Port: ptr.To(int32(8091)),
 			},
+			MaxRequestBodySize: ptr.To(int64(10485760)),
 		},
 	}
 }

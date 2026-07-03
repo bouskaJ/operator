@@ -20,22 +20,23 @@ import (
 	"context"
 
 	olpredicate "github.com/operator-framework/operator-lib/predicate"
-	"github.com/securesign/operator/internal/controller/annotations"
-	"github.com/securesign/operator/internal/controller/common/action/transitions"
-	"github.com/securesign/operator/internal/controller/labels"
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/action/transitions"
+	"github.com/securesign/operator/internal/annotations"
+	"github.com/securesign/operator/internal/controller"
+	"github.com/securesign/operator/internal/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/securesign/operator/internal/controller/ctlog/actions"
-	fulcioActions "github.com/securesign/operator/internal/controller/fulcio/actions"
 	v12 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
-	"github.com/securesign/operator/internal/controller/common/action"
+	fulcioActions "github.com/securesign/operator/internal/controller/fulcio/actions"
 	v1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -43,14 +44,24 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/controller/ctlog/actions/monitor"
+	tasPredicate "github.com/securesign/operator/internal/controller/predicate"
 )
 
-// CTlogReconciler reconciles a CTlog object
-type CTlogReconciler struct {
+// ctlogReconciler reconciles a CTlog object
+type ctlogReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	scheme   *runtime.Scheme
+	recorder events.EventRecorder
+}
+
+func NewReconciler(c client.Client, scheme *runtime.Scheme, recorder events.EventRecorder) controller.Controller {
+	return &ctlogReconciler{
+		Client:   c,
+		scheme:   scheme,
+		recorder: recorder,
+	}
 }
 
 //+kubebuilder:rbac:groups=rhtas.redhat.com,resources=ctlogs,verbs=get;list;watch;create;update;patch;delete
@@ -66,12 +77,12 @@ type CTlogReconciler struct {
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.14.1/pkg/reconcile
-func (r *CTlogReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *ctlogReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 
-	var instance rhtasv1alpha1.CTlog
+	var instance rhtasv1.CTlog
 	rlog := log.FromContext(ctx)
 
-	if err := r.Client.Get(ctx, req.NamespacedName, &instance); err != nil {
+	if err := r.Get(ctx, req.NamespacedName, &instance); err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -88,14 +99,19 @@ func (r *CTlogReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	target := instance.DeepCopy()
-	acs := []action.Action[*rhtasv1alpha1.CTlog]{
-		transitions.NewToPendingPhaseAction[*rhtasv1alpha1.CTlog](func(_ *rhtasv1alpha1.CTlog) []string {
-			return []string{actions.CertCondition, actions.ConfigCondition}
-		}),
-		transitions.NewToCreatePhaseAction[*rhtasv1alpha1.CTlog](),
+	conditionSupplier := func(_ *rhtasv1.CTlog) []string {
+		return []string{actions.CertCondition, actions.SignerCondition, actions.ConfigCondition, actions.TLSCondition}
+	}
+	acs := []action.Action[*rhtasv1.CTlog]{
+		transitions.NewToPendingPhaseAction[*rhtasv1.CTlog](),
+		transitions.NewEnsureConditionsAction[*rhtasv1.CTlog](conditionSupplier),
+
+		actions.NewTlsAction(),
+
+		transitions.NewToCreatePhaseAction[*rhtasv1.CTlog](),
 
 		actions.NewHandleFulcioCertAction(),
-		actions.NewHandleKeysAction(),
+		actions.NewGenerateSignerAction(),
 		actions.NewResolveTreeAction(),
 		actions.NewServerConfigAction(),
 
@@ -104,16 +120,24 @@ func (r *CTlogReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		actions.NewServiceAction(),
 		actions.NewCreateMonitorAction(),
 
-		transitions.NewToInitializePhaseAction[*rhtasv1alpha1.CTlog](),
+		monitor.NewRBACAction(),
+		monitor.NewStatefulSetAction(),
+		monitor.NewCreateServiceAction(),
+		monitor.NewCreateMonitorAction(),
+
+		actions.NewStatusUrlAction(),
+		transitions.NewToInitializePhaseAction[*rhtasv1.CTlog](),
 
 		actions.NewInitializeAction(),
+
+		transitions.NewToReadyPhaseAction[*rhtasv1.CTlog](),
 	}
 
 	for _, a := range acs {
 		rlog.V(2).Info("Executing " + a.Name())
 		a.InjectClient(r.Client)
 		a.InjectLogger(rlog.WithName(a.Name()))
-		a.InjectRecorder(r.Recorder)
+		a.InjectRecorder(r.recorder)
 
 		if a.CanHandle(ctx, target) {
 			rlog.V(1).Info("Executing " + a.Name())
@@ -127,9 +151,9 @@ func (r *CTlogReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *CTlogReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *ctlogReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Filter out with the pause annotation.
-	pause, err := olpredicate.NewPause(annotations.PausedReconciliation)
+	pause, err := olpredicate.NewPause[client.Object](annotations.PausedReconciliation)
 	if err != nil {
 		return err
 	}
@@ -153,7 +177,7 @@ func (r *CTlogReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		WithEventFilter(pause).
-		For(&rhtasv1alpha1.CTlog{}).
+		For(&rhtasv1.CTlog{}, builder.WithPredicates(tasPredicate.ConfigurationChangedOnFailurePredicate[*rhtasv1.CTlog]())).
 		Owns(&v1.Deployment{}).
 		Owns(&v12.Service{}).
 		WatchesMetadata(partialSecret, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
@@ -169,7 +193,7 @@ func (r *CTlogReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				}
 			}
 
-			list := &rhtasv1alpha1.CTlogList{}
+			list := &rhtasv1.CTlogList{}
 			err := mgr.GetClient().List(ctx, list, client.InNamespace(object.GetNamespace()))
 			if err != nil {
 				return make([]reconcile.Request, 0)

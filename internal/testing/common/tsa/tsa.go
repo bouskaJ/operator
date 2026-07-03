@@ -4,50 +4,52 @@ import (
 	"context"
 	"testing"
 
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/common/action"
-	"github.com/securesign/operator/internal/controller/constants"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/constants"
+	"github.com/securesign/operator/internal/state"
 	testAction "github.com/securesign/operator/internal/testing/action"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-func GenerateTSAInstance() *rhtasv1alpha1.TimestampAuthority {
-	return &rhtasv1alpha1.TimestampAuthority{
+func GenerateTSAInstance() *rhtasv1.TimestampAuthority {
+	return &rhtasv1.TimestampAuthority{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "timestampAuthority",
 			Namespace: "default",
 		},
-		Status: rhtasv1alpha1.TimestampAuthorityStatus{
+		Status: rhtasv1.TimestampAuthorityStatus{
 			Conditions: []metav1.Condition{
 				{
-					Type:   constants.Ready,
-					Reason: constants.Ready,
+					Type:   constants.ReadyCondition,
+					Reason: state.Ready.String(),
 				},
 			},
-			NTPMonitoring: nil,
-			Signer:        nil,
+			NtpConfigRef: nil,
+			Signer:       nil,
 		},
-		Spec: rhtasv1alpha1.TimestampAuthoritySpec{
-			Signer: rhtasv1alpha1.TimestampAuthoritySigner{
-				CertificateChain: rhtasv1alpha1.CertificateChain{
-					RootCA: &rhtasv1alpha1.TsaCertificateAuthority{
+		Spec: rhtasv1.TimestampAuthoritySpec{
+			Signer: rhtasv1.TimestampAuthoritySigner{
+				CertificateChain: rhtasv1.CertificateChain{
+					RootCA: &rhtasv1.TsaCertificateAuthority{
 						OrganizationName: "Red Hat",
 					},
-					IntermediateCA: []*rhtasv1alpha1.TsaCertificateAuthority{
+					IntermediateCA: []*rhtasv1.TsaCertificateAuthority{
 						{
 							OrganizationName: "Red Hat",
 						},
 					},
-					LeafCA: &rhtasv1alpha1.TsaCertificateAuthority{
+					LeafCA: &rhtasv1.TsaCertificateAuthority{
 						OrganizationName: "Red Hat",
 					},
 				},
 			},
-			NTPMonitoring: rhtasv1alpha1.NTPMonitoring{
-				Enabled: true,
-				Config: &rhtasv1alpha1.NtpMonitoringConfig{
+			NTPMonitoring: rhtasv1.NTPMonitoring{
+				Enabled: ptr.To(true),
+				Config: &rhtasv1.NtpMonitoringConfig{
 					RequestAttempts: 3,
 					RequestTimeout:  5,
 					NumServers:      4,
@@ -61,7 +63,7 @@ func GenerateTSAInstance() *rhtasv1alpha1.TimestampAuthority {
 	}
 }
 
-func TsaTestSetup(instance *rhtasv1alpha1.TimestampAuthority, t *testing.T, client client.WithWatch, action action.Action[*rhtasv1alpha1.TimestampAuthority], initObjs ...client.Object) (client.WithWatch, action.Action[*rhtasv1alpha1.TimestampAuthority]) {
+func TsaTestSetup(instance *rhtasv1.TimestampAuthority, t *testing.T, client client.WithWatch, action action.Action[*rhtasv1.TimestampAuthority], initObjs ...client.Object) (client.WithWatch, action.Action[*rhtasv1.TimestampAuthority]) {
 	if client == nil {
 		client = testAction.FakeClientBuilder().WithObjects(instance).WithStatusSubresource(instance).Build()
 	}

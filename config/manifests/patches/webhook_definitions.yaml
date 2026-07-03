@@ -1,0 +1,164 @@
+# Webhook definitions for OLM-managed deployments.
+# OLM uses these to create webhook configs, services, and inject TLS certs.
+#
+# When deployed via OLM, OLM takes full ownership of cert management:
+#   - generates its own CA and serving certs
+#   - injects caBundle into CRDs and webhook configs
+#   - mounts certs into the operator deployment
+#
+# The service-ca annotations (inject-cabundle, serving-cert-secret-name) are
+# stripped from the OLM bundle by config/manifests/openshift/kustomization.yaml
+# to prevent conflicts between OLM and service-ca cert management.
+- op: add
+  path: /spec/webhookdefinitions
+  value:
+  - type: ConversionWebhook
+    conversionCRDs:
+    - securesigns.rhtas.redhat.com
+    - fulcios.rhtas.redhat.com
+    - trillians.rhtas.redhat.com
+    - rekors.rhtas.redhat.com
+    - tufs.rhtas.redhat.com
+    - ctlogs.rhtas.redhat.com
+    - timestampauthorities.rhtas.redhat.com
+    generateName: crhtas-redhat-com
+    sideEffects: None
+    admissionReviewVersions:
+    - v1
+    containerPort: 9443
+    targetPort: 9443
+    deploymentName: operator-controller-manager
+    webhookPath: /convert
+  - type: MutatingAdmissionWebhook
+    generateName: msecuresign.kb.io
+    rules:
+    - apiGroups:
+      - rhtas.redhat.com
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      - UPDATE
+      resources:
+      - securesigns
+    sideEffects: None
+    admissionReviewVersions:
+    - v1
+    containerPort: 9443
+    targetPort: 9443
+    deploymentName: operator-controller-manager
+    webhookPath: /mutate-rhtas-redhat-com-v1-securesign
+  - type: MutatingAdmissionWebhook
+    generateName: mfulcio.kb.io
+    rules:
+    - apiGroups:
+      - rhtas.redhat.com
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      - UPDATE
+      resources:
+      - fulcios
+    sideEffects: None
+    admissionReviewVersions:
+    - v1
+    containerPort: 9443
+    targetPort: 9443
+    deploymentName: operator-controller-manager
+    webhookPath: /mutate-rhtas-redhat-com-v1-fulcio
+  - type: MutatingAdmissionWebhook
+    generateName: mtrillian.kb.io
+    rules:
+    - apiGroups:
+      - rhtas.redhat.com
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      - UPDATE
+      resources:
+      - trillians
+    sideEffects: None
+    admissionReviewVersions:
+    - v1
+    containerPort: 9443
+    targetPort: 9443
+    deploymentName: operator-controller-manager
+    webhookPath: /mutate-rhtas-redhat-com-v1-trillian
+  - type: MutatingAdmissionWebhook
+    generateName: mrekor.kb.io
+    rules:
+    - apiGroups:
+      - rhtas.redhat.com
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      - UPDATE
+      resources:
+      - rekors
+    sideEffects: None
+    admissionReviewVersions:
+    - v1
+    containerPort: 9443
+    targetPort: 9443
+    deploymentName: operator-controller-manager
+    webhookPath: /mutate-rhtas-redhat-com-v1-rekor
+  - type: MutatingAdmissionWebhook
+    generateName: mtuf.kb.io
+    rules:
+    - apiGroups:
+      - rhtas.redhat.com
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      - UPDATE
+      resources:
+      - tufs
+    sideEffects: None
+    admissionReviewVersions:
+    - v1
+    containerPort: 9443
+    targetPort: 9443
+    deploymentName: operator-controller-manager
+    webhookPath: /mutate-rhtas-redhat-com-v1-tuf
+  - type: MutatingAdmissionWebhook
+    generateName: mctlog.kb.io
+    rules:
+    - apiGroups:
+      - rhtas.redhat.com
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      - UPDATE
+      resources:
+      - ctlogs
+    sideEffects: None
+    admissionReviewVersions:
+    - v1
+    containerPort: 9443
+    targetPort: 9443
+    deploymentName: operator-controller-manager
+    webhookPath: /mutate-rhtas-redhat-com-v1-ctlog
+  - type: MutatingAdmissionWebhook
+    generateName: mtimestampauthority.kb.io
+    rules:
+    - apiGroups:
+      - rhtas.redhat.com
+      apiVersions:
+      - v1
+      operations:
+      - CREATE
+      - UPDATE
+      resources:
+      - timestampauthorities
+    sideEffects: None
+    admissionReviewVersions:
+    - v1
+    containerPort: 9443
+    targetPort: 9443
+    deploymentName: operator-controller-manager
+    webhookPath: /mutate-rhtas-redhat-com-v1-timestampauthority

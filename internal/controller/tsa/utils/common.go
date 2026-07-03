@@ -1,14 +1,20 @@
 package tsaUtils
 
 import (
-	"github.com/securesign/operator/api/v1alpha1"
+	rhtasv1 "github.com/securesign/operator/api/v1"
 )
 
-func IsFileType(instance *v1alpha1.TimestampAuthority) bool {
+const (
+	FileType = "file"
+	KmsType  = "kms"
+	TinkType = "tink"
+)
+
+func IsFileType(instance *rhtasv1.TimestampAuthority) bool {
 	return GetSignerType(&instance.Spec.Signer) == FileType
 }
 
-func GetSignerType(signer *v1alpha1.TimestampAuthoritySigner) string {
+func GetSignerType(signer *rhtasv1.TimestampAuthoritySigner) string {
 	if signer.Kms != nil {
 		return KmsType
 	}

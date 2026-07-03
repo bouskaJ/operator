@@ -1,32 +1,27 @@
 package actions
 
-import (
-	"github.com/securesign/operator/internal/controller/labels"
-)
-
 const (
-	DeploymentName     = "ctlog"
-	ComponentName      = "ctlog"
-	RBACName           = "ctlog"
-	MonitoringRoleName = "prometheus-k8s-ctlog"
+	DeploymentName         = "ctlog"
+	ComponentName          = "ctlog"
+	RBACName               = "ctlog"
+	RBACMonitorName        = "ctlog-monitor"
+	MonitoringRoleName     = "prometheus-k8s-ctlog"
+	MonitorStatefulSetName = "ctlog-monitor"
+	MonitorComponentName   = "ctlog-monitor"
 
-	CertCondition = "FulcioCertAvailable"
+	CertCondition    = "FulcioCertAvailable"
+	TLSCondition     = "ServerTLS"
+	ConfigCondition  = "ServerConfigAvailable"
+	SignerCondition  = "SignerAvailable"
+	SignerKeyReason  = "SignerKey"
+	FulcioReason     = "FulcioCertificate"
+	MonitorCondition = "MonitorAvailable"
 
-	ConfigCondition    = "ServerConfigAvailable"
-	TrillianTreeReason = "TrillianTree"
-	SignerKeyReason    = "SignerKey"
-	FulcioReason       = "FulcioCertificate"
-
-	ServerPortName   = "http"
-	ServerPort       = 80
-	ServerTargetPort = 6962
-	MetricsPortName  = "metrics"
-	MetricsPort      = 6963
-	ServerCondition  = "ServerAvailable"
-
-	CTLPubLabel       = labels.LabelNamespace + "/ctfe.pub"
-	CTLogPrivateLabel = labels.LabelNamespace + "/ctfe.private"
-
-	privateKeyRefAnnotation  = labels.LabelNamespace + "/privateKeyRef"
-	passwordKeyRefAnnotation = labels.LabelNamespace + "/passwordKeyRef"
+	ServerPortName         = "http"
+	ServerTargetPort       = 6962
+	MetricsPortName        = "metrics"
+	MetricsPort            = 6963
+	TLSSecret              = "%s-ctlog-tls"
+	MonitorMetricsPortName = "monitor-metrics"
+	MonitorMetricsPort     = 9464
 )

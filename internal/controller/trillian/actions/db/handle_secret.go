@@ -2,29 +2,25 @@ package db
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strconv"
 
-	"github.com/securesign/operator/internal/controller/common/utils/kubernetes"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/action"
+	trillian "github.com/securesign/operator/internal/controller/trillian/actions"
+	"github.com/securesign/operator/internal/labels"
+	"github.com/securesign/operator/internal/state"
+	utils2 "github.com/securesign/operator/internal/utils"
+	"github.com/securesign/operator/internal/utils/kubernetes"
+	"github.com/securesign/operator/internal/utils/kubernetes/ensure"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierros "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
-
-	"github.com/securesign/operator/internal/controller/common/utils"
-
-	"github.com/securesign/operator/internal/controller/common"
-	"github.com/securesign/operator/internal/controller/common/action"
-	"github.com/securesign/operator/internal/controller/constants"
-	labels2 "github.com/securesign/operator/internal/controller/labels"
-	trillian "github.com/securesign/operator/internal/controller/trillian/actions"
-	trillianUtils "github.com/securesign/operator/internal/controller/trillian/utils"
 	"k8s.io/apimachinery/pkg/api/meta"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apilabels "k8s.io/apimachinery/pkg/labels"
 )
 
 const (
@@ -35,15 +31,15 @@ const (
 	dbConnectionResource   = "trillian-db-connection"
 	dbConnectionSecretName = "trillian-db-connection-"
 
-	annotationDatabase = labels2.LabelNamespace + "/" + trillianUtils.SecretDatabaseName
-	annotationUser     = labels2.LabelNamespace + "/" + trillianUtils.SecretUser
-	annotationPort     = labels2.LabelNamespace + "/" + trillianUtils.SecretPort
-	annotationHost     = labels2.LabelNamespace + "/" + trillianUtils.SecretHost
+	annotationDatabase = labels.LabelNamespace + "/" + trillian.SecretDatabaseName
+	annotationUser     = labels.LabelNamespace + "/" + trillian.SecretUser
+	annotationPort     = labels.LabelNamespace + "/" + trillian.SecretPort
+	annotationHost     = labels.LabelNamespace + "/" + trillian.SecretHost
 )
 
-var ErrMissingDBConfiguration = errors.New("expecting external DB configuration")
+var managedAnnotations = []string{annotationDatabase, annotationUser, annotationPort, annotationHost}
 
-func NewHandleSecretAction() action.Action[*rhtasv1alpha1.Trillian] {
+func NewHandleSecretAction() action.Action[*rhtasv1.Trillian] {
 	return &handleSecretAction{}
 }
 
@@ -55,9 +51,9 @@ func (i handleSecretAction) Name() string {
 	return "create db secret"
 }
 
-func (i handleSecretAction) CanHandle(_ context.Context, instance *rhtasv1alpha1.Trillian) bool {
+func (i handleSecretAction) CanHandle(_ context.Context, instance *rhtasv1.Trillian) bool {
 	switch {
-	case instance.Status.Db.DatabaseSecretRef == nil:
+	case utils2.OptionalBool(instance.Spec.Db.Create) && instance.Status.Db.DatabaseSecretRef == nil:
 		return true
 	case !equality.Semantic.DeepDerivative(instance.Spec.Db.DatabaseSecretRef, instance.Status.Db.DatabaseSecretRef):
 		return true
@@ -66,30 +62,20 @@ func (i handleSecretAction) CanHandle(_ context.Context, instance *rhtasv1alpha1
 	}
 }
 
-func (i handleSecretAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Trillian) *action.Result {
+func (i handleSecretAction) Handle(ctx context.Context, instance *rhtasv1.Trillian) *action.Result {
 	// external database
-	if !utils.OptionalBool(instance.Spec.Db.Create) {
-		if instance.Spec.Db.DatabaseSecretRef == nil {
-			meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-				Type:    trillian.DbCondition,
-				Status:  metav1.ConditionFalse,
-				Reason:  constants.Failure,
-				Message: ErrMissingDBConfiguration.Error(),
-			})
-			return i.FailedWithStatusUpdate(ctx, ErrMissingDBConfiguration, instance)
-		}
-
+	if !utils2.OptionalBool(instance.Spec.Db.Create) {
+		// copy deprecated DatabaseSecretRef for backward compatibility
 		if !equality.Semantic.DeepEqual(instance.Spec.Db.DatabaseSecretRef, instance.Status.Db.DatabaseSecretRef) {
 			instance.Status.Db.DatabaseSecretRef = instance.Spec.Db.DatabaseSecretRef
-			meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-				Type:    trillian.DbCondition,
-				Status:  metav1.ConditionTrue,
-				Reason:  constants.Ready,
-				Message: "Working with external DB",
-			})
-			return i.StatusUpdate(ctx, instance)
 		}
-		return i.Continue()
+		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
+			Type:    trillian.DbCondition,
+			Status:  metav1.ConditionTrue,
+			Reason:  state.Ready.String(),
+			Message: "Working with external DB",
+		})
+		return i.ReturnOnChange(i.PersistStatus)(ctx, instance)
 	}
 
 	// managed database
@@ -104,7 +90,7 @@ func (i handleSecretAction) Handle(ctx context.Context, instance *rhtasv1alpha1.
 
 		// update database connection by spec
 		instance.Status.Db.DatabaseSecretRef = instance.Spec.Db.DatabaseSecretRef
-		return i.StatusUpdate(ctx, instance)
+		return i.ReturnOnChange(i.PersistStatus)(ctx, instance)
 	}
 
 	// skip if status exists
@@ -112,19 +98,19 @@ func (i handleSecretAction) Handle(ctx context.Context, instance *rhtasv1alpha1.
 		return i.Continue()
 	}
 
-	dbLabels := labels2.For(trillian.DbComponentName, trillian.DbDeploymentName, instance.Name)
-	dbLabels[labels2.LabelResource] = dbConnectionResource
+	dbLabels := labels.For(trillian.DbComponentName, trillian.DbDeploymentName, instance.Name)
+	dbLabels[labels.LabelResource] = dbConnectionResource
 
-	partialSecrets, err := kubernetes.ListSecrets(ctx, i.Client, instance.Namespace, labels.SelectorFromSet(dbLabels).String())
+	partialSecrets, err := kubernetes.ListSecrets(ctx, i.Client, instance.Namespace, apilabels.SelectorFromSet(dbLabels).String())
 	if err != nil {
-		return i.Failed(fmt.Errorf("can't load secrets: %w", err))
+		return i.Error(ctx, fmt.Errorf("can't load secrets: %w", err), instance)
 	}
 
 	for _, partialSecret := range partialSecrets.Items {
 		// use first db-connection and remove all other
 		if instance.Status.Db.DatabaseSecretRef == nil &&
 			equality.Semantic.DeepDerivative(i.secretAnnotations(), partialSecret.GetAnnotations()) {
-			instance.Status.Db.DatabaseSecretRef = &rhtasv1alpha1.LocalObjectReference{
+			instance.Status.Db.DatabaseSecretRef = &rhtasv1.LocalObjectReference{
 				Name: partialSecret.Name,
 			}
 			continue
@@ -141,58 +127,48 @@ func (i handleSecretAction) Handle(ctx context.Context, instance *rhtasv1alpha1.
 	}
 
 	if instance.Status.Db.DatabaseSecretRef != nil {
-		return i.StatusUpdate(ctx, instance)
+		return i.ReturnOnChange(i.PersistStatus)(ctx, instance)
 	}
 
-	dbSecret := i.createDbSecret(instance.Namespace, dbLabels)
-	if err = controllerutil.SetControllerReference(instance, dbSecret, i.Client.Scheme()); err != nil {
-		return i.Failed(fmt.Errorf("could not set controller reference for secret: %w", err))
+	dbSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: dbConnectionSecretName,
+			Namespace:    instance.Namespace,
+		},
+	}
+	if _, err = kubernetes.CreateOrUpdate(ctx, i.Client,
+		dbSecret,
+		ensure.Labels[*corev1.Secret](slices.Collect(maps.Keys(dbLabels)), dbLabels),
+		ensure.Annotations[*corev1.Secret](managedAnnotations, i.secretAnnotations()),
+		kubernetes.EnsureSecretData(true, i.defaultDBData()),
+	); err != nil {
+		return i.Error(ctx, fmt.Errorf("can't generate certificate secret: %w", err), instance,
+			metav1.Condition{
+				Type:    trillian.DbCondition,
+				Status:  metav1.ConditionFalse,
+				Reason:  state.Failure.String(),
+				Message: err.Error(),
+			})
 	}
 
-	// no watch on secret - continue if no error
-	if _, err = i.Ensure(ctx, dbSecret); err != nil {
-		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:    trillian.DbCondition,
-			Status:  metav1.ConditionFalse,
-			Reason:  constants.Failure,
-			Message: err.Error(),
-		})
-		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:    constants.Ready,
-			Status:  metav1.ConditionFalse,
-			Reason:  constants.Failure,
-			Message: err.Error(),
-		})
-		return i.FailedWithStatusUpdate(ctx, fmt.Errorf("could not create DB secret: %w", err), instance)
-	}
-
-	instance.Status.Db.DatabaseSecretRef = &rhtasv1alpha1.LocalObjectReference{
+	instance.Status.Db.DatabaseSecretRef = &rhtasv1.LocalObjectReference{
 		Name: dbSecret.Name,
 	}
-	return i.StatusUpdate(ctx, instance)
+	return i.ReturnOnChange(i.PersistStatus)(ctx, instance)
 }
-func (i handleSecretAction) createDbSecret(namespace string, labels map[string]string) *corev1.Secret {
+func (i handleSecretAction) defaultDBData() map[string][]byte {
 	// Define a new Secret object
 	var rootPass []byte
 	var mysqlPass []byte
-	rootPass = common.GeneratePassword(12)
-	mysqlPass = common.GeneratePassword(12)
-	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: dbConnectionSecretName,
-			Namespace:    namespace,
-			Labels:       labels,
-			Annotations:  i.secretAnnotations(),
-		},
-		Type: "Opaque",
-		Data: map[string][]byte{
-			trillianUtils.SecretRootPassword: rootPass,
-			trillianUtils.SecretPassword:     mysqlPass,
-			trillianUtils.SecretDatabaseName: []byte(databaseName),
-			trillianUtils.SecretUser:         []byte(user),
-			trillianUtils.SecretPort:         []byte(strconv.Itoa(port)),
-			trillianUtils.SecretHost:         []byte(host),
-		},
+	rootPass = utils2.GeneratePassword(12)
+	mysqlPass = utils2.GeneratePassword(12)
+	return map[string][]byte{
+		trillian.SecretRootPassword: rootPass,
+		trillian.SecretPassword:     mysqlPass,
+		trillian.SecretDatabaseName: []byte(databaseName),
+		trillian.SecretUser:         []byte(user),
+		trillian.SecretPort:         []byte(strconv.Itoa(port)),
+		trillian.SecretHost:         []byte(host),
 	}
 }
 

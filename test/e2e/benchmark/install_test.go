@@ -10,13 +10,13 @@ import (
 
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
-	"github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/common/utils"
 	"github.com/securesign/operator/test/e2e/support"
+	"github.com/securesign/operator/test/e2e/support/postgresql"
+	"github.com/securesign/operator/test/e2e/support/steps"
 	"github.com/securesign/operator/test/e2e/support/tas"
+	"github.com/securesign/operator/test/e2e/support/tas/securesign"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -33,6 +33,8 @@ func BenchmarkInstall(b *testing.B) {
 		b.Fatalf("could not create client: %v", err)
 	}
 
+	fipsEnabled := steps.IsFIPSCluster(context.Background(), cli)
+
 	loop := func(iteration int) {
 		var (
 			namespaceName   string
@@ -48,16 +50,24 @@ func BenchmarkInstall(b *testing.B) {
 		defer deleteNamespace(ctx, cli, namespaceName)
 		defer dumpNamespace(ctx, cli, b, namespaceName)
 
+		if fipsEnabled {
+			if err := postgresql.CreateDB(ctx, cli, namespaceName, postgresql.DefaultSecretName, "fips-password"); err != nil {
+				b.Fatalf("could not create postgresql: %v", err)
+			}
+			postgresql.WaitAndLoadSchema(ctx, cli, namespaceName)
+		}
+
 		targetImageName = support.PrepareImage(context.Background())
 
 		b.StartTimer()
-		err = installTAS(ctx, cli, namespaceName)
+		err = installTAS(ctx, cli, namespaceName, fipsEnabled)
 		b.StopTimer()
 
 		if err != nil {
 			b.Fatalf("could not install: %v", err)
 		}
-		tas.VerifyByCosign(ctx, cli, &v1alpha1.Securesign{ObjectMeta: metav1.ObjectMeta{Namespace: namespaceName, Name: "test"}}, targetImageName)
+		s := securesign.Get(ctx, cli, namespaceName, "test")
+		tas.VerifyByCosign(ctx, targetImageName, s.Status.TufStatus.Url, s.Status.FulcioStatus.Url, s.Status.RekorStatus.Url, s.Status.TSAStatus.Url)
 	}
 
 	b.ResetTimer()
@@ -79,86 +89,16 @@ func createNamespace(ctx context.Context, cli client.Client, iteration int) (str
 	return namespace.Name, nil
 }
 
-func installTAS(ctx context.Context, cli client.Client, namespace string) error {
-	instance := &v1alpha1.Securesign{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace,
-			Name:      "test",
-			Annotations: map[string]string{
-				"rhtas.redhat.com/metrics": "false",
-			},
-		},
-		Spec: v1alpha1.SecuresignSpec{
-			Rekor: v1alpha1.RekorSpec{
-				ExternalAccess: v1alpha1.ExternalAccess{
-					Enabled: true,
-				},
-				RekorSearchUI: v1alpha1.RekorSearchUI{
-					Enabled: utils.Pointer(true),
-				},
-			},
-			Fulcio: v1alpha1.FulcioSpec{
-				ExternalAccess: v1alpha1.ExternalAccess{
-					Enabled: true,
-				},
-				Config: v1alpha1.FulcioConfig{
-					OIDCIssuers: []v1alpha1.OIDCIssuer{
-						{
-							ClientID:  support.OidcClientID(),
-							IssuerURL: support.OidcIssuerUrl(),
-							Issuer:    support.OidcIssuerUrl(),
-							Type:      "email",
-						},
-					}},
-				Certificate: v1alpha1.FulcioCert{
-					OrganizationName:  "MyOrg",
-					OrganizationEmail: "my@email.org",
-					CommonName:        "fulcio",
-				},
-			},
-			Ctlog: v1alpha1.CTlogSpec{},
-			Tuf: v1alpha1.TufSpec{
-				ExternalAccess: v1alpha1.ExternalAccess{
-					Enabled: true,
-				},
-			},
-			Trillian: v1alpha1.TrillianSpec{Db: v1alpha1.TrillianDB{
-				Create: ptr.To(true),
-			}},
-			TimestampAuthority: &v1alpha1.TimestampAuthoritySpec{
-				ExternalAccess: v1alpha1.ExternalAccess{
-					Enabled: true,
-				},
-				Signer: v1alpha1.TimestampAuthoritySigner{
-					CertificateChain: v1alpha1.CertificateChain{
-						RootCA: &v1alpha1.TsaCertificateAuthority{
-							OrganizationName:  "MyOrg",
-							OrganizationEmail: "my@email.org",
-							CommonName:        "tsa.hostname",
-						},
-						IntermediateCA: []*v1alpha1.TsaCertificateAuthority{
-							{
-								OrganizationName:  "MyOrg",
-								OrganizationEmail: "my@email.org",
-								CommonName:        "tsa.hostname",
-							},
-						},
-						LeafCA: &v1alpha1.TsaCertificateAuthority{
-							OrganizationName:  "MyOrg",
-							OrganizationEmail: "my@email.org",
-							CommonName:        "tsa.hostname",
-						},
-					},
-				},
-			},
-		},
-	}
+func installTAS(ctx context.Context, cli client.Client, namespace string, fipsEnabled bool) error {
+	instance := securesign.Create(namespace, "test",
+		securesign.ChooseDefaults(fipsEnabled, namespace),
+	)
 
 	if err := cli.Create(ctx, instance); err != nil {
 		return fmt.Errorf("creating instance: %w", err)
 	}
 
-	tas.VerifyAllComponents(ctx, cli, instance, true)
+	tas.VerifyAllComponents(ctx, cli, instance, !fipsEnabled, true)
 
 	return nil
 }

@@ -16,9 +16,16 @@ import (
 	"math/big"
 	"time"
 
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/common/utils/kubernetes"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/utils"
+	"github.com/securesign/operator/internal/utils/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+const (
+	KeyCertificateChain       = "certificateChain"
+	KeyLeafPrivateKey         = "leafPrivateKey"
+	KeyLeafPrivateKeyPassword = "leafPrivateKeyPassword"
 )
 
 type TsaCertChainConfig struct {
@@ -56,38 +63,36 @@ func (c TsaCertChainConfig) ToMap() map[string][]byte {
 		}
 	}
 	if len(c.LeafPrivateKey) > 0 {
-		result["leafPrivateKey"] = c.LeafPrivateKey
+		result[KeyLeafPrivateKey] = c.LeafPrivateKey
 	}
 	if len(c.LeafPrivateKeyPassword) > 0 {
-		result["leafPrivateKeyPassword"] = c.LeafPrivateKeyPassword
+		result[KeyLeafPrivateKeyPassword] = c.LeafPrivateKeyPassword
 	}
 	if len(c.CertificateChain) > 0 {
-		result["certificateChain"] = c.CertificateChain
+		result[KeyCertificateChain] = c.CertificateChain
 	}
 
 	return result
 }
 
-func CreatePrivateKey(key *ecdsa.PrivateKey, password []byte) ([]byte, error) {
+func CreatePrivateKey(key *ecdsa.PrivateKey) ([]byte, error) {
 	mKey, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
 		return nil, err
 	}
 
-	block, err := x509.EncryptPEMBlock(rand.Reader, "EC PRIVATE KEY", mKey, password, x509.PEMCipherAES256) //nolint:staticcheck
-	if err != nil {
-		return nil, err
-	}
-
 	var pemData bytes.Buffer
-	if err := pem.Encode(&pemData, block); err != nil {
+	if err := pem.Encode(&pemData, &pem.Block{
+		Type:  "EC PRIVATE KEY",
+		Bytes: mKey,
+	}); err != nil {
 		return nil, err
 	}
 
 	return pemData.Bytes(), nil
 }
 
-func CreateTSACertChain(ctx context.Context, instance *rhtasv1alpha1.TimestampAuthority, deploymentName string, client client.Client, config *TsaCertChainConfig) ([]byte, error) {
+func CreateTSACertChain(ctx context.Context, instance *rhtasv1.TimestampAuthority, deploymentName string, client client.Client, config *TsaCertChainConfig) ([]byte, error) {
 	var err error
 
 	rootIssuer, err := CreateCAIssuer(instance, instance.Spec.Signer.CertificateChain.RootCA, ctx, deploymentName, client)
@@ -111,7 +116,7 @@ func CreateTSACertChain(ctx context.Context, instance *rhtasv1alpha1.TimestampAu
 	}
 
 	rootPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "CERTIFICATE",
+		Type:  "CERTIFICATE", //nolint:goconst
 		Bytes: rootCert,
 	})
 
@@ -119,7 +124,7 @@ func CreateTSACertChain(ctx context.Context, instance *rhtasv1alpha1.TimestampAu
 	oidTimeStamping := asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 3, 8}
 	ekuValues, err := asn1.Marshal([]asn1.ObjectIdentifier{oidTimeStamping})
 	if err != nil {
-		return nil, fmt.Errorf("Failed to encode EKU values: %s", err)
+		return nil, fmt.Errorf("failed to encode EKU values: %s", err)
 	}
 	ekuExtension := pkix.Extension{
 		Id:       oidExtendedKeyUsage,
@@ -206,6 +211,7 @@ func parsePrivateKey(privateKeyPEM []byte, password []byte) (crypto.PrivateKey, 
 	}
 
 	keyBytes := block.Bytes
+	// Deprecated: kept for backward compatibility with existing encrypted keys.
 	if x509.IsEncryptedPEMBlock(block) { //nolint:staticcheck
 		keyBytes, err = x509.DecryptPEMBlock(block, password) //nolint:staticcheck
 		if err != nil {
@@ -231,7 +237,7 @@ func parsePrivateKey(privateKeyPEM []byte, password []byte) (crypto.PrivateKey, 
 	}
 }
 
-func CreateCAIssuer(instance *rhtasv1alpha1.TimestampAuthority, tsaCA *rhtasv1alpha1.TsaCertificateAuthority, ctx context.Context, deploymentName string, client client.Client) (*Issuer, error) {
+func CreateCAIssuer(instance *rhtasv1.TimestampAuthority, tsaCA *rhtasv1.TsaCertificateAuthority, ctx context.Context, deploymentName string, client client.Client) (*Issuer, error) {
 	issuer := &Issuer{}
 	var err error
 
@@ -240,7 +246,7 @@ func CreateCAIssuer(instance *rhtasv1alpha1.TimestampAuthority, tsaCA *rhtasv1al
 	}
 
 	if tsaCA.CommonName == "" {
-		if instance.Spec.ExternalAccess.Enabled {
+		if utils.IsEnabled(instance.Spec.ExternalAccess.Enabled) {
 			if instance.Spec.ExternalAccess.Host != "" {
 				issuer.subject.CommonName = instance.Spec.ExternalAccess.Host
 			} else {

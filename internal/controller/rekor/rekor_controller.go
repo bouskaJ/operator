@@ -19,50 +19,55 @@ package rekor
 import (
 	"context"
 
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/action/transitions"
+	"github.com/securesign/operator/internal/annotations"
+	"github.com/securesign/operator/internal/controller"
+	redis "github.com/securesign/operator/internal/controller/rekor/actions/searchIndex/redis/actions"
+	"github.com/securesign/operator/internal/utils"
 	"k8s.io/apimachinery/pkg/types"
 
 	olpredicate "github.com/operator-framework/operator-lib/predicate"
-	"github.com/securesign/operator/internal/controller/annotations"
-	"github.com/securesign/operator/internal/controller/common/action/transitions"
-
 	actions2 "github.com/securesign/operator/internal/controller/rekor/actions"
 	backfillredis "github.com/securesign/operator/internal/controller/rekor/actions/backfillRedis"
-	"github.com/securesign/operator/internal/controller/rekor/actions/redis"
+	"github.com/securesign/operator/internal/controller/rekor/actions/monitor"
 	"github.com/securesign/operator/internal/controller/rekor/actions/server"
 	"github.com/securesign/operator/internal/controller/rekor/actions/ui"
 	v13 "k8s.io/api/core/v1"
 	v1 "k8s.io/api/networking/v1"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 
-	"github.com/securesign/operator/internal/controller/common/action"
 	v12 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/controller/predicate"
 	batchv1 "k8s.io/api/batch/v1"
 )
 
-// RekorReconciler reconciles a Rekor object
-type RekorReconciler struct {
+// rekorReconciler reconciles a Rekor object
+type rekorReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	scheme   *runtime.Scheme
+	recorder events.EventRecorder
+}
+
+func NewReconciler(c client.Client, scheme *runtime.Scheme, recorder events.EventRecorder) controller.Controller {
+	return &rekorReconciler{
+		Client:   c,
+		scheme:   scheme,
+		recorder: recorder,
+	}
 }
 
 //+kubebuilder:rbac:groups=rhtas.redhat.com,resources=rekors,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=rhtas.redhat.com,resources=rekors/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=rhtas.redhat.com,resources=rekors/finalizers,verbs=update
-//+kubebuilder:rbac:groups=rhtas.redhat.com,resources=secrets,verbs=create;get;list;watch;update;patch;delete
-//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=create;get;list;watch;update;patch;delete
-//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=create;get;list;watch;update;patch;delete
-//+kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=create;get;list;watch;update;patch;delete
-//+kubebuilder:rbac:groups="batch",resources=cronjobs,verbs=create;get;list;watch;update;patch;delete
-//+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
-//+kubebuilder:rbac:groups="",resources=endpoints,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -73,11 +78,11 @@ type RekorReconciler struct {
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.14.1/pkg/reconcile
-func (r *RekorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	var instance rhtasv1alpha1.Rekor
+func (r *rekorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var instance rhtasv1.Rekor
 	log := ctrllog.FromContext(ctx)
 
-	if err := r.Client.Get(ctx, req.NamespacedName, &instance); err != nil {
+	if err := r.Get(ctx, req.NamespacedName, &instance); err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -94,20 +99,32 @@ func (r *RekorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	target := instance.DeepCopy()
-	actions := []action.Action[*rhtasv1alpha1.Rekor]{
-		transitions.NewToPendingPhaseAction[*rhtasv1alpha1.Rekor](func(rekor *rhtasv1alpha1.Rekor) []string {
-			components := []string{actions2.ServerCondition, actions2.RedisCondition, actions2.SignerCondition}
-			if *rekor.Spec.RekorSearchUI.Enabled {
-				components = append(components, actions2.UICondition)
-			}
-			return components
-		}),
+	conditionSupplier := func(rekor *rhtasv1.Rekor) []string {
+		components := []string{actions2.ServerCondition, actions2.SignerCondition}
+		if utils.OptionalBool(rekor.Spec.RekorSearchUI.Enabled) {
+			components = append(components, actions2.UICondition)
+		}
+		if utils.OptionalBool(rekor.Spec.SearchIndex.Create) {
+			components = append(components, actions2.RedisCondition)
+		}
+		return components
+	}
+	actions := []action.Action[*rhtasv1.Rekor]{
+		transitions.NewToPendingPhaseAction[*rhtasv1.Rekor](),
+		transitions.NewEnsureConditionsAction[*rhtasv1.Rekor](conditionSupplier),
 
+		redis.NewTlsAction(),
+		redis.NewGeneratePasswordAction(),
 		server.NewGenerateSignerAction(),
 
-		transitions.NewToCreatePhaseAction[*rhtasv1alpha1.Rekor](),
+		transitions.NewToCreatePhaseAction[*rhtasv1.Rekor](),
 
-		actions2.NewRBACAction(),
+		server.NewRBACAction(),
+		ui.NewRBACAction(),
+		redis.NewRBACAction(),
+		backfillredis.NewRBACAction(),
+		monitor.NewRBACAction(),
+
 		server.NewShardingConfigAction(),
 		server.NewResolveTreeAction(),
 		server.NewCreatePvcAction(),
@@ -123,25 +140,28 @@ func (r *RekorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		ui.NewDeployAction(),
 		ui.NewCreateServiceAction(),
 		ui.NewIngressAction(),
+		ui.NewStatusURLAction(),
 
 		backfillredis.NewBackfillRedisCronJobAction(),
 
-		transitions.NewToInitializePhaseAction[*rhtasv1alpha1.Rekor](),
-		// INITIALIZE
+		monitor.NewStatefulSetAction(),
+		monitor.NewCreateServiceAction(),
+		monitor.NewCreateMonitorAction(),
+
+		transitions.NewToInitializePhaseAction[*rhtasv1.Rekor](),
+
 		server.NewInitializeAction(),
 		server.NewResolvePubKeyAction(),
-
 		ui.NewInitializeAction(),
 		redis.NewInitializeAction(),
 
-		// INITIALIZE -> READY
-		actions2.NewInitializeAction(),
+		transitions.NewToReadyPhaseAction[*rhtasv1.Rekor](),
 	}
 
 	for _, a := range actions {
 		a.InjectClient(r.Client)
 		a.InjectLogger(log.WithName(a.Name()))
-		a.InjectRecorder(r.Recorder)
+		a.InjectRecorder(r.recorder)
 
 		if a.CanHandle(ctx, target) {
 			log.V(2).Info("Executing " + a.Name())
@@ -155,17 +175,18 @@ func (r *RekorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *RekorReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *rekorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Filter out with the pause annotation.
-	pause, err := olpredicate.NewPause(annotations.PausedReconciliation)
+	pause, err := olpredicate.NewPause[client.Object](annotations.PausedReconciliation)
 	if err != nil {
 		return err
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		WithEventFilter(pause).
-		For(&rhtasv1alpha1.Rekor{}).
+		For(&rhtasv1.Rekor{}, builder.WithPredicates(predicate.ConfigurationChangedOnFailurePredicate[*rhtasv1.Rekor]())).
 		Owns(&v12.Deployment{}).
+		Owns(&v12.StatefulSet{}).
 		Owns(&v13.Service{}).
 		Owns(&v1.Ingress{}).
 		Owns(&batchv1.CronJob{}).

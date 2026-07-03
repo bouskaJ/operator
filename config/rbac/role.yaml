@@ -7,17 +7,12 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - endpoints
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - events
+  - configmaps
+  - secrets
   verbs:
   - create
+  - delete
+  - deletecollection
   - get
   - list
   - patch
@@ -26,21 +21,55 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - pods
+  - namespaces
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resourceNames:
+  - trusted-artifact-signer
+  resources:
+  - namespaces
+  verbs:
+  - delete
+  - patch
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
+  - serviceaccounts
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - apiregistration.k8s.io
+  resources:
+  - apiservices
   verbs:
   - get
   - list
   - watch
 - apiGroups:
-  - apiextensions.k8s.io
-  resources:
-  - customresourcedefinitions
-  verbs:
-  - get
-- apiGroups:
   - apps
   resources:
   - deployments
+  - statefulsets
   verbs:
   - create
   - delete
@@ -58,20 +87,21 @@ rules:
   - list
   - watch
 - apiGroups:
-  - batch
+  - authentication.k8s.io
   resources:
-  - cronjobs
+  - tokenreviews
   verbs:
   - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
 - apiGroups:
   - batch
   resources:
+  - cronjobs
   - jobs
   verbs:
   - create
@@ -82,121 +112,66 @@ rules:
   - update
   - watch
 - apiGroups:
+  - config.openshift.io
+  resourceNames:
+  - cluster
+  resources:
+  - ingresses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - console.openshift.io
   resources:
   - consoleclidownloads
   verbs:
   - create
+  - get
+  - list
+  - watch
+- apiGroups:
+  - console.openshift.io
+  resourceNames:
+  - cosign
+  - createtree
+  - ec
+  - fetch-tsa-certs
+  - gitsign
+  - rekor-cli
+  - tuftool
+  - updatetree
+  resources:
+  - consoleclidownloads
+  verbs:
   - delete
+  - patch
+  - update
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - create
+  - get
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
   - get
   - list
   - patch
   - update
   - watch
-- apiGroups:
-  - ""
-  resources:
-  - configmaps
-  verbs:
-  - create
-  - delete
-  - deletecollection
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - namespaces
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - persistentvolumeclaims
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - persistentvolumeclaims/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - create
-  - delete
-  - deletecollection
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - serviceaccounts
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - services
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - monitoring.coreos.com
-  resources:
-  - prometheuses/api
-  verbs:
-  - create
-  - get
-  - update
 - apiGroups:
   - monitoring.coreos.com
   resources:
   - servicemonitors
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - networking
-  resources:
-  - ingresses
   verbs:
   - create
   - delete
@@ -218,66 +193,11 @@ rules:
   - update
   - watch
 - apiGroups:
-  - operator.openshift.io
-  resources:
-  - consoles
-  verbs:
-  - get
-  - list
-- apiGroups:
-  - operator.openshift.io
-  resources:
-  - ingresscontrollers
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
   - rbac.authorization.k8s.io
   resources:
   - clusterrolebindings
-  verbs:
-  - create
-  - delete
-  - deletecollection
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - rbac.authorization.k8s.io
-  resources:
   - clusterroles
-  verbs:
-  - create
-  - delete
-  - deletecollection
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - rbac.authorization.k8s.io
-  resources:
   - rolebindings
-  verbs:
-  - create
-  - delete
-  - deletecollection
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - rbac.authorization.k8s.io
-  resources:
   - roles
   verbs:
   - create
@@ -292,173 +212,11 @@ rules:
   - rhtas.redhat.com
   resources:
   - ctlogs
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
-  - ctlogs/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
-  - ctlogs/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
   - fulcios
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
-  - fulcios/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
-  - fulcios/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
   - rekors
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
-  - rekors/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
-  - rekors/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
-  - secrets
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
   - securesigns
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
-  - securesigns/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
-  - securesigns/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
   - timestampauthorities
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
-  - timestampauthorities/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
-  - timestampauthorities/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
   - trillians
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
-  - trillians/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
-  - trillians/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - rhtas.redhat.com
-  resources:
   - tufs
   verbs:
   - create
@@ -471,26 +229,26 @@ rules:
 - apiGroups:
   - rhtas.redhat.com
   resources:
+  - ctlogs/finalizers
+  - fulcios/finalizers
+  - rekors/finalizers
+  - securesigns/finalizers
+  - timestampauthorities/finalizers
+  - trillians/finalizers
   - tufs/finalizers
   verbs:
   - update
 - apiGroups:
   - rhtas.redhat.com
   resources:
+  - ctlogs/status
+  - fulcios/status
+  - rekors/status
+  - securesigns/status
+  - timestampauthorities/status
+  - trillians/status
   - tufs/status
   verbs:
   - get
   - patch
   - update
-- apiGroups:
-  - route.openshift.io
-  resources:
-  - routes
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch

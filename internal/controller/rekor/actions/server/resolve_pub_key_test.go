@@ -9,19 +9,19 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/state"
+	"github.com/securesign/operator/internal/utils/kubernetes"
 	"k8s.io/utils/ptr"
 
 	. "github.com/onsi/gomega"
-	"github.com/securesign/operator/internal/controller/common/action"
-	"github.com/securesign/operator/internal/controller/common/utils/kubernetes"
 	"github.com/securesign/operator/internal/controller/rekor/actions"
 	testAction "github.com/securesign/operator/internal/testing/action"
 	httpmock "github.com/securesign/operator/internal/testing/http"
 	v1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/constants"
+	rhtasv1 "github.com/securesign/operator/api/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -34,13 +34,13 @@ func TestResolvePubKey_CanHandle(t *testing.T) {
 		name      string
 		status    metav1.ConditionStatus
 		canHandle bool
-		ref       *v1alpha1.SecretKeySelector
+		ref       *rhtasv1.SecretKeySelector
 	}{
 		{
 			name:      "ref set",
 			status:    metav1.ConditionFalse,
 			canHandle: false,
-			ref:       &v1alpha1.SecretKeySelector{},
+			ref:       &rhtasv1.SecretKeySelector{},
 		},
 		{
 			name:      "no server condition",
@@ -65,8 +65,8 @@ func TestResolvePubKey_CanHandle(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			a := NewResolvePubKeyAction()
-			instance := v1alpha1.Rekor{
-				Status: v1alpha1.RekorStatus{
+			instance := rhtasv1.Rekor{
+				Status: rhtasv1.RekorStatus{
 					PublicKeyRef: tt.ref,
 				},
 			}
@@ -104,7 +104,7 @@ func TestResolvePubKey_Handle(t *testing.T) {
 				objects: []client.Object{},
 			},
 			want: want{
-				result:    testAction.StatusUpdate(),
+				result:    testAction.Return(),
 				publicKey: testPublicKey,
 			},
 		},
@@ -112,15 +112,22 @@ func TestResolvePubKey_Handle(t *testing.T) {
 			name: "remove label from old secret",
 			env: env{
 				objects: []client.Object{
-					kubernetes.CreateSecret("old-secret", "default", map[string][]byte{
-						"public": testPublicKey2,
-					}, map[string]string{
-						RekorPubLabel: "public",
-					}),
+					&v1.Secret{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "old-secret",
+							Namespace: "default",
+							Labels: map[string]string{
+								RekorPubLabel: "public",
+							},
+						},
+						Data: map[string][]byte{
+							"public": testPublicKey2,
+						},
+					},
 				},
 			},
 			want: want{
-				result:    testAction.StatusUpdate(),
+				result:    testAction.Return(),
 				publicKey: testPublicKey,
 			},
 		},
@@ -128,15 +135,22 @@ func TestResolvePubKey_Handle(t *testing.T) {
 			name: "use existing secret",
 			env: env{
 				objects: []client.Object{
-					kubernetes.CreateSecret("secret", "default", map[string][]byte{
-						"public": testPublicKey,
-					}, map[string]string{
-						RekorPubLabel: "public",
-					}),
+					&v1.Secret{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "secret",
+							Namespace: "default",
+							Labels: map[string]string{
+								RekorPubLabel: "public",
+							},
+						},
+						Data: map[string][]byte{
+							"public": testPublicKey,
+						},
+					},
 				},
 			},
 			want: want{
-				result:    testAction.StatusUpdate(),
+				result:    testAction.Return(),
 				publicKey: testPublicKey,
 			},
 		},
@@ -144,32 +158,53 @@ func TestResolvePubKey_Handle(t *testing.T) {
 			name: "remove label from old secret and use existing secret",
 			env: env{
 				objects: []client.Object{
-					kubernetes.CreateSecret("old-secret-1", "default", map[string][]byte{
-						"public": testPublicKey2,
-					}, map[string]string{
-						RekorPubLabel: "public",
-					}),
-					kubernetes.CreateSecret("secret", "default", map[string][]byte{
-						"public": testPublicKey,
-					}, map[string]string{
-						RekorPubLabel: "public",
-					}),
-					kubernetes.CreateSecret("old-secret-2", "default", map[string][]byte{
-						"public": testPublicKey2,
-					}, map[string]string{
-						RekorPubLabel: "public",
-					}),
+					&v1.Secret{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "old-secret-1",
+							Namespace: "default",
+							Labels: map[string]string{
+								RekorPubLabel: "public",
+							},
+						},
+						Data: map[string][]byte{
+							"public": testPublicKey2,
+						},
+					},
+					&v1.Secret{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "secret",
+							Namespace: "default",
+							Labels: map[string]string{
+								RekorPubLabel: "public",
+							},
+						},
+						Data: map[string][]byte{
+							"public": testPublicKey,
+						},
+					},
+					&v1.Secret{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "old-secret-2",
+							Namespace: "default",
+							Labels: map[string]string{
+								RekorPubLabel: "public",
+							},
+						},
+						Data: map[string][]byte{
+							"public": testPublicKey2,
+						},
+					},
 				},
 			},
 			want: want{
-				result:    testAction.StatusUpdate(),
+				result:    testAction.Return(),
 				publicKey: testPublicKey,
 			},
 		},
 		{
 			name: "unable to resolve public key",
 			want: want{
-				result:    testAction.FailedWithStatusUpdate(fmt.Errorf("ResolvePubKey: unable to resolve public key: unexpected http response ")),
+				result:    testAction.Error(fmt.Errorf("ResolvePubKey: unable to resolve public key: unexpected http response ")),
 				publicKey: nil,
 			},
 		},
@@ -177,18 +212,18 @@ func TestResolvePubKey_Handle(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.TODO()
-			instance := &v1alpha1.Rekor{
+			instance := &rhtasv1.Rekor{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "rekor",
 					Namespace: "default",
 				},
-				Status: v1alpha1.RekorStatus{
+				Status: rhtasv1.RekorStatus{
 					TreeID:       ptr.To(int64(123456789)),
 					PublicKeyRef: nil,
 					Conditions: []metav1.Condition{
 						{
 							Type:   actions.ServerCondition,
-							Reason: constants.Initialize,
+							Reason: state.Initialize.String(),
 							Status: metav1.ConditionFalse,
 						},
 					},

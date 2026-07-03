@@ -1,0 +1,98 @@
+name: 'Install and configure Kind cluster'
+description: 'Customized Kind-action'
+
+inputs:
+  config:
+    description: 'Kind config'
+    required: true
+  olm:
+    description: 'install olm'
+    required: true
+    default: 'false'
+  keycloak:
+    description: 'install keycloak'
+    required: true
+    default: 'false'
+  prometheus:
+    description: 'install prometheus'
+    required: true
+    default: 'false'
+  nfs-csi:
+    description: 'install nfs-csi'
+    required: false
+    default: 'false'
+
+outputs:
+  oidc_host:
+    value: ${{ steps.install-keycloak.outputs.oidc_host }}
+    description: 'Keycloak OIDC host'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Cluster
+      uses: helm/kind-action@v1.12.0
+      with:
+        version: v0.31.0
+        node_image: kindest/node:v1.35.0
+        kubectl_version: v1.35.0
+        cluster_name: kind
+        config: ${{ inputs.config }}
+        ignore_failed_clean: true
+
+    - name: Configure ingress
+      shell: bash
+      run: |
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.14.3/deploy/static/provider/kind/deploy.yaml
+        kubectl wait --namespace ingress-nginx --for=condition=ready pod --selector=app.kubernetes.io/component=controller --timeout=90s
+
+    - name: Install cert-manager
+      shell: bash
+      run: |
+        kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.20.2/cert-manager.yaml
+        kubectl wait --for=condition=Available deployment/cert-manager -n cert-manager --timeout=120s
+        kubectl wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=120s
+        kubectl wait --for=condition=Available deployment/cert-manager-cainjector -n cert-manager --timeout=120s
+
+    - name: Install prometheus
+      if: ${{ inputs.prometheus == 'true'}}
+      shell: bash
+      run: |
+        # Download the bundle.yaml
+        curl -sL https://github.com/prometheus-operator/prometheus-operator/releases/download/v0.84.0/bundle.yaml -o bundle.yaml 
+        
+        # Check if the download was successful and the file is not empty
+        if [ ! -s "bundle.yaml" ]; then
+          echo "Error: Downloaded bundle.yaml is empty or failed to download."
+          exit 1
+        fi
+        
+        kubectl create -f bundle.yaml 
+
+        echo "Waiting for prometheus-operator pod to be ready..."
+        kubectl wait --for=condition=Ready pods -l  app.kubernetes.io/name=prometheus-operator -n default --timeout=90s
+
+    - name: Install olm
+      if: ${{ inputs.olm  == 'true'}}
+      shell: bash
+      run: |
+        #install OLM
+        kubectl create -f https://github.com/operator-framework/operator-lifecycle-manager/releases/download/v0.32.0/crds.yaml
+        # wait for a while to be sure CRDs are installed
+        sleep 1
+        kubectl create -f https://github.com/operator-framework/operator-lifecycle-manager/releases/download/v0.32.0/olm.yaml
+
+    - name: Install keycloak
+      if: ${{ inputs.keycloak  == 'true'}}
+      id: install-keycloak
+      shell: bash
+      run: |
+        bash ci/keycloak/tas-keycloak-install.sh kind
+        echo "oidc_host=keycloak-internal.keycloak-system.svc" >> $GITHUB_OUTPUT
+
+    - name: Install NFS-CSI
+      if: ${{ inputs.nfs-csi  == 'true'}}
+      id: install-nfs-csi
+      shell: bash
+      run: |
+        kustomize build --enable-helm ./ci/nfs/overlay/ | kubectl apply -f -

@@ -2,21 +2,26 @@ package actions
 
 import (
 	"context"
+	"fmt"
+	"maps"
+	"slices"
 
-	"github.com/securesign/operator/internal/controller/annotations"
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/annotations"
+	"github.com/securesign/operator/internal/constants"
+	"github.com/securesign/operator/internal/labels"
+	"github.com/securesign/operator/internal/state"
+	"github.com/securesign/operator/internal/utils/kubernetes"
+	"github.com/securesign/operator/internal/utils/kubernetes/ensure"
 
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/common/action"
-	"github.com/securesign/operator/internal/controller/constants"
+	rhtasv1 "github.com/securesign/operator/api/v1"
 	"github.com/securesign/operator/internal/controller/ctlog/actions"
-	"github.com/securesign/operator/internal/controller/labels"
 	"k8s.io/apimachinery/pkg/api/meta"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-func NewCtlogAction() action.Action[*rhtasv1alpha1.Securesign] {
+func NewCtlogAction() action.Action[*rhtasv1.Securesign] {
 	return &ctlogAction{}
 }
 
@@ -28,57 +33,57 @@ func (i ctlogAction) Name() string {
 	return "create ctlog"
 }
 
-func (i ctlogAction) CanHandle(context.Context, *rhtasv1alpha1.Securesign) bool {
+func (i ctlogAction) CanHandle(context.Context, *rhtasv1.Securesign) bool {
 	return true
 }
 
-func (i ctlogAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Securesign) *action.Result {
+func (i ctlogAction) Handle(ctx context.Context, instance *rhtasv1.Securesign) *action.Result {
 	var (
-		err     error
-		updated bool
+		err    error
+		result controllerutil.OperationResult
+		l      = labels.For(actions.ComponentName, instance.Name, instance.Name)
+		ctl    = &rhtasv1.CTlog{
+			ObjectMeta: v1.ObjectMeta{
+				Name:      instance.Name,
+				Namespace: instance.Namespace,
+			},
+		}
 	)
-	ctlog := &rhtasv1alpha1.CTlog{}
 
-	ctlog.Name = instance.Name
-	ctlog.Namespace = instance.Namespace
-	ctlog.Labels = labels.For(actions.ComponentName, ctlog.Name, instance.Name)
-	ctlog.Annotations = annotations.FilterInheritable(instance.Annotations)
-
-	ctlog.Spec = instance.Spec.Ctlog
-
-	if err = controllerutil.SetControllerReference(instance, ctlog, i.Client.Scheme()); err != nil {
-		return i.Failed(err)
+	if result, err = kubernetes.CreateOrUpdate(ctx, i.Client,
+		ctl,
+		ensure.ControllerReference[*rhtasv1.CTlog](instance, i.Client),
+		ensure.Labels[*rhtasv1.CTlog](slices.Collect(maps.Keys(l)), l),
+		ensure.Annotations[*rhtasv1.CTlog](annotations.InheritableAnnotations, instance.Annotations),
+		func(object *rhtasv1.CTlog) error {
+			object.Spec = instance.Spec.Ctlog
+			return nil
+		},
+	); err != nil {
+		return i.Error(ctx, fmt.Errorf("could not create Ctlog: %w", err), instance,
+			v1.Condition{
+				Type:    CTlogCondition,
+				Status:  v1.ConditionFalse,
+				Reason:  state.Failure.String(),
+				Message: err.Error(),
+			})
 	}
 
-	if updated, err = i.Ensure(ctx, ctlog); err != nil {
+	if result != controllerutil.OperationResultNone {
 		meta.SetStatusCondition(&instance.Status.Conditions, v1.Condition{
 			Type:    CTlogCondition,
 			Status:  v1.ConditionFalse,
-			Reason:  constants.Failure,
-			Message: err.Error(),
+			Reason:  state.Creating.String(),
+			Message: "CTLog resource updated " + ctl.Name,
 		})
-		return i.FailedWithStatusUpdate(ctx, err, instance)
+		return i.ReturnOnChange(i.PersistStatus)(ctx, instance)
 	}
 
-	if updated {
-		meta.SetStatusCondition(&instance.Status.Conditions, v1.Condition{
-			Type:    CTlogCondition,
-			Status:  v1.ConditionFalse,
-			Reason:  constants.Creating,
-			Message: "CTLog resource updated " + ctlog.Name,
-		})
-		return i.StatusUpdate(ctx, instance)
-	}
-
-	return i.CopyStatus(ctx, client.ObjectKeyFromObject(ctlog), instance)
+	return i.CopyStatus(ctx, ctl, instance)
 }
 
-func (i ctlogAction) CopyStatus(ctx context.Context, ok client.ObjectKey, instance *rhtasv1alpha1.Securesign) *action.Result {
-	ctl := &rhtasv1alpha1.CTlog{}
-	if err := i.Client.Get(ctx, ok, ctl); err != nil {
-		return i.Failed(err)
-	}
-	objectStatus := meta.FindStatusCondition(ctl.Status.Conditions, constants.Ready)
+func (i ctlogAction) CopyStatus(ctx context.Context, ctl *rhtasv1.CTlog, instance *rhtasv1.Securesign) *action.Result {
+	objectStatus := meta.FindStatusCondition(ctl.Status.Conditions, constants.ReadyCondition)
 	if objectStatus == nil {
 		// not initialized yet, wait for update
 		return i.Continue()
@@ -89,7 +94,7 @@ func (i ctlogAction) CopyStatus(ctx context.Context, ok client.ObjectKey, instan
 			Status: objectStatus.Status,
 			Reason: objectStatus.Reason,
 		})
-		return i.StatusUpdate(ctx, instance)
+		return i.ReturnOnChange(i.PersistStatus)(ctx, instance)
 	}
 	return i.Continue()
 }

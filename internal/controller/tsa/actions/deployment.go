@@ -3,22 +3,46 @@ package actions
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
+	"strings"
 
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/common/action"
-	"github.com/securesign/operator/internal/controller/constants"
-	"github.com/securesign/operator/internal/controller/labels"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/annotations"
+	"github.com/securesign/operator/internal/constants"
 	tsaUtils "github.com/securesign/operator/internal/controller/tsa/utils"
+	"github.com/securesign/operator/internal/images"
+	"github.com/securesign/operator/internal/labels"
+	"github.com/securesign/operator/internal/state"
+	"github.com/securesign/operator/internal/utils"
+	"github.com/securesign/operator/internal/utils/kubernetes"
+	"github.com/securesign/operator/internal/utils/kubernetes/ensure"
+	"github.com/securesign/operator/internal/utils/kubernetes/ensure/deployment"
+	apps "k8s.io/api/apps/v1"
+	core "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+)
+
+const (
+	chainVolumeName      = "tsa-cert-chain"
+	fileSignerVolumeName = "tsa-file-signer-config"
+	tinkSignerVolumeName = "tsa-tink-signer-config"
+	ntpConfigVolumeName  = "ntp-config"
+	certChainMountPath   = constants.SecretMountPath + "/certificate_chain"
+	fileSignerMountPath  = constants.SecretMountPath + "/file_signer"
+	tinkSignerMountPath  = constants.SecretMountPath + "/tink_signer"
+	NtpMountPath         = constants.SecretMountPath + "/ntp_config"
 )
 
 type deployAction struct {
 	action.BaseAction
 }
 
-func NewDeployAction() action.Action[*rhtasv1alpha1.TimestampAuthority] {
+func NewDeployAction() action.Action[*rhtasv1.TimestampAuthority] {
 	return &deployAction{}
 }
 
@@ -26,73 +50,240 @@ func (i deployAction) Name() string {
 	return "deploy"
 }
 
-func (i deployAction) CanHandle(ctx context.Context, instance *rhtasv1alpha1.TimestampAuthority) bool {
-	c := meta.FindStatusCondition(instance.GetConditions(), constants.Ready)
-	if instance.Spec.Signer.CertificateChain.CertificateChainRef == nil &&
-		(instance.Spec.Signer.CertificateChain.RootCA == nil ||
-			instance.Spec.Signer.CertificateChain.LeafCA == nil) {
-		return false
-	}
-
-	return (c.Reason == constants.Ready || c.Reason == constants.Creating)
+func (i deployAction) CanHandle(ctx context.Context, instance *rhtasv1.TimestampAuthority) bool {
+	return state.FromInstance(instance, constants.ReadyCondition) >= state.Creating
 }
 
-func (i deployAction) Handle(ctx context.Context, instance *rhtasv1alpha1.TimestampAuthority) *action.Result {
+func (i deployAction) Handle(ctx context.Context, instance *rhtasv1.TimestampAuthority) *action.Result {
 	var (
-		updated bool
-		err     error
+		result controllerutil.OperationResult
+		err    error
 	)
 
 	labels := labels.For(ComponentName, DeploymentName, instance.Name)
-	deployment, err := tsaUtils.CreateTimestampAuthorityDeployment(instance, DeploymentName, RBACName, labels)
-	if err != nil {
-		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:               TSAServerCondition,
-			Status:             metav1.ConditionFalse,
-			Reason:             constants.Failure,
-			Message:            err.Error(),
-			ObservedGeneration: instance.Generation,
-		})
-		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:               constants.Ready,
-			Status:             metav1.ConditionFalse,
-			Reason:             constants.Failure,
-			Message:            err.Error(),
-			ObservedGeneration: instance.Generation,
-		})
-	}
-	if err = controllerutil.SetControllerReference(instance, deployment, i.Client.Scheme()); err != nil {
-		return i.Failed(fmt.Errorf("could not set controller reference for Deployment: %w", err))
+
+	if result, err = kubernetes.CreateOrUpdate(ctx, i.Client,
+		&apps.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      DeploymentName,
+				Namespace: instance.Namespace,
+			},
+		},
+		i.ensureDeployment(instance, RBACName, labels),
+		ensure.ControllerReference[*apps.Deployment](instance, i.Client),
+		ensure.Labels[*apps.Deployment](slices.Collect(maps.Keys(labels)), labels),
+		deployment.Proxy(),
+		deployment.GODEBUG(instance.GetAnnotations()),
+		deployment.TrustedCA(instance.GetTrustedCA(), DeploymentName),
+		deployment.PodRequirements(instance.Spec.PodRequirements, DeploymentName),
+		deployment.PodSecurityContext(),
+	); err != nil {
+		return i.Error(ctx, fmt.Errorf("could not create TSA Server: %w", err), instance)
 	}
 
-	if updated, err = i.Ensure(ctx, deployment); err != nil {
+	if result != controllerutil.OperationResultNone {
 		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:               TSAServerCondition,
+			Type:               constants.ReadyCondition,
 			Status:             metav1.ConditionFalse,
-			Reason:             constants.Failure,
-			Message:            err.Error(),
-			ObservedGeneration: instance.Generation,
-		})
-		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:               constants.Ready,
-			Status:             metav1.ConditionFalse,
-			Reason:             constants.Failure,
-			Message:            err.Error(),
-			ObservedGeneration: instance.Generation,
-		})
-		return i.FailedWithStatusUpdate(ctx, fmt.Errorf("could not create TSA Server: %w", err), instance)
-	}
-
-	if updated {
-		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:               TSAServerCondition,
-			Status:             metav1.ConditionFalse,
-			Reason:             constants.Creating,
+			Reason:             state.Creating.String(),
 			Message:            "TSA server deployment created",
 			ObservedGeneration: instance.Generation,
 		})
-		return i.StatusUpdate(ctx, instance)
+		return i.ReturnOnChange(i.PersistStatus)(ctx, instance)
 	} else {
 		return i.Continue()
+	}
+}
+
+func (i deployAction) ensureDeployment(instance *rhtasv1.TimestampAuthority, sa string, labels map[string]string) func(*apps.Deployment) error {
+	return func(dp *apps.Deployment) error {
+
+		appArgs := []string{
+			"timestamp-server",
+			"serve",
+			"--host=0.0.0.0",
+			"--port=3000",
+			fmt.Sprintf("--log-type=%s", utils.GetOrDefault(instance.GetAnnotations(), annotations.LogType, string(constants.Prod))),
+			fmt.Sprintf("--certificate-chain-path=%s/certificate-chain.pem", certChainMountPath),
+			fmt.Sprintf("--disable-ntp-monitoring=%v", !utils.IsEnabled(instance.Spec.NTPMonitoring.Enabled)),
+		}
+		if instance.Spec.MaxRequestBodySize != nil {
+			appArgs = append(appArgs, "--max-request-body-size", fmt.Sprintf("%d", *instance.Spec.MaxRequestBodySize))
+		}
+
+		spec := &dp.Spec
+		spec.Replicas = utils.Pointer[int32](1)
+		spec.Selector = &metav1.LabelSelector{
+			MatchLabels: labels,
+		}
+
+		template := &spec.Template
+		template.Labels = labels
+		template.Spec.ServiceAccountName = sa
+
+		container := kubernetes.FindContainerByNameOrCreate(&template.Spec, DeploymentName)
+
+		chainVolume := kubernetes.FindVolumeByNameOrCreate(&template.Spec, chainVolumeName)
+		if chainVolume.Secret == nil {
+			chainVolume.Secret = &core.SecretVolumeSource{}
+		}
+		chainVolume.Secret.SecretName = instance.Status.Signer.CertificateChainRef.Name
+		chainVolume.Secret.Items = []core.KeyToPath{
+			{
+				Key:  instance.Status.Signer.CertificateChainRef.Key,
+				Path: "certificate-chain.pem",
+			},
+		}
+
+		chainVolumeMount := kubernetes.FindVolumeMountByNameOrCreate(container, chainVolumeName)
+		chainVolumeMount.MountPath = certChainMountPath
+		chainVolumeMount.ReadOnly = true
+
+		if utils.IsEnabled(instance.Spec.NTPMonitoring.Enabled) {
+			if instance.Status.NtpConfigRef != nil {
+				ntpConfigVolume := kubernetes.FindVolumeByNameOrCreate(&template.Spec, ntpConfigVolumeName)
+				if ntpConfigVolume.ConfigMap == nil {
+					ntpConfigVolume.ConfigMap = &core.ConfigMapVolumeSource{}
+				}
+				ntpConfigVolume.ConfigMap.Name = instance.Status.NtpConfigRef.Name
+
+				ntpConfigVolumeMount := kubernetes.FindVolumeMountByNameOrCreate(container, ntpConfigVolumeName)
+				ntpConfigVolumeMount.ReadOnly = true
+				ntpConfigVolumeMount.MountPath = NtpMountPath
+
+				appArgs = append(appArgs,
+					fmt.Sprintf("--ntp-monitoring=%s/ntp-config.yaml", NtpMountPath),
+				)
+			}
+		}
+
+		if err := ensure.ContainerAuth(container, instance.Spec.Signer.Auth)(&template.Spec); err != nil {
+			return err
+		}
+
+		switch tsaUtils.GetSignerType(&instance.Spec.Signer) {
+		case tsaUtils.FileType:
+			{
+
+				fileSignerVolume := kubernetes.FindVolumeByNameOrCreate(&template.Spec, fileSignerVolumeName)
+				if fileSignerVolume.Secret == nil {
+					fileSignerVolume.Secret = &core.SecretVolumeSource{}
+				}
+				fileSignerVolume.Secret.SecretName = instance.Status.Signer.FileSigner.PrivateKeyRef.Name
+				fileSignerVolume.Secret.Items = []core.KeyToPath{
+					{
+						Key:  instance.Status.Signer.FileSigner.PrivateKeyRef.Key,
+						Path: "private_key.pem",
+					},
+				}
+
+				fileSignerVolumeMount := kubernetes.FindVolumeMountByNameOrCreate(container, fileSignerVolumeName)
+				fileSignerVolumeMount.MountPath = fileSignerMountPath
+				fileSignerVolumeMount.ReadOnly = true
+
+				appArgs = append(appArgs,
+					"--timestamp-signer=file",
+					fmt.Sprintf("--file-signer-key-path=%s/private_key.pem", fileSignerMountPath),
+				)
+
+				if instance.Status.Signer.FileSigner.PasswordRef != nil {
+					fileSignerPasswordEnv := kubernetes.FindEnvByNameOrCreate(container, "SIGNER_PASSWORD")
+					fileSignerPasswordEnv.ValueFrom = &core.EnvVarSource{
+						SecretKeyRef: &core.SecretKeySelector{
+							LocalObjectReference: core.LocalObjectReference{
+								Name: instance.Status.Signer.FileSigner.PasswordRef.Name,
+							},
+							Key: instance.Status.Signer.FileSigner.PasswordRef.Key,
+						},
+					}
+					appArgs = append(appArgs, "--file-signer-passwd=$(SIGNER_PASSWORD)")
+				}
+			}
+		case tsaUtils.KmsType:
+			{
+				appArgs = append(appArgs,
+					"--timestamp-signer=kms",
+					fmt.Sprintf("--kms-key-resource=%s", instance.Spec.Signer.Kms.KeyResource),
+				)
+			}
+		case tsaUtils.TinkType:
+			{
+				tinkSignerVolume := kubernetes.FindVolumeByNameOrCreate(&template.Spec, tinkSignerVolumeName)
+				if tinkSignerVolume.Secret == nil {
+					tinkSignerVolume.Secret = &core.SecretVolumeSource{}
+				}
+				tinkSignerVolume.Secret.SecretName = instance.Spec.Signer.Tink.KeysetRef.Name
+				tinkSignerVolume.Secret.Items = []core.KeyToPath{
+					{
+						Key:  instance.Spec.Signer.Tink.KeysetRef.Key,
+						Path: "encryptedKeySet",
+					},
+				}
+
+				tinkSignerVolumeMount := kubernetes.FindVolumeMountByNameOrCreate(container, tinkSignerVolumeName)
+				tinkSignerVolumeMount.MountPath = tinkSignerMountPath
+				tinkSignerVolumeMount.ReadOnly = true
+
+				appArgs = append(appArgs,
+					"--timestamp-signer=tink",
+					fmt.Sprintf("--tink-key-resource=%s", instance.Spec.Signer.Tink.KeyResource),
+					fmt.Sprintf("--tink-keyset-path=%s/encryptedKeySet", tinkSignerMountPath),
+				)
+
+				if strings.HasPrefix(instance.Spec.Signer.Tink.KeyResource, "hcvault://") {
+					appArgs = append(appArgs, "--tink-hcvault-token=$(VAULT_TOKEN)")
+				}
+
+			}
+		}
+
+		container.Image = images.Registry.Get(images.TimestampAuthority)
+		container.Command = appArgs
+
+		port := kubernetes.FindPortByNameOrCreate(container, "3000-tcp")
+		port.ContainerPort = 3000
+		port.Protocol = core.ProtocolTCP
+
+		if container.LivenessProbe == nil {
+			container.LivenessProbe = &core.Probe{}
+		}
+		if container.LivenessProbe.HTTPGet == nil {
+			container.LivenessProbe.HTTPGet = &core.HTTPGetAction{}
+		}
+		container.LivenessProbe.HTTPGet.Path = "/ping"
+		container.LivenessProbe.HTTPGet.Port = intstr.FromInt32(3000)
+		container.LivenessProbe.InitialDelaySeconds = 0
+		container.LivenessProbe.PeriodSeconds = 10
+		container.LivenessProbe.TimeoutSeconds = 1
+		container.LivenessProbe.FailureThreshold = 3
+
+		if container.ReadinessProbe == nil {
+			container.ReadinessProbe = &core.Probe{}
+		}
+		if container.ReadinessProbe.HTTPGet == nil {
+			container.ReadinessProbe.HTTPGet = &core.HTTPGetAction{}
+		}
+		container.ReadinessProbe.HTTPGet.Path = "/ping"
+		container.ReadinessProbe.HTTPGet.Port = intstr.FromInt32(3000)
+		container.ReadinessProbe.InitialDelaySeconds = 0
+		container.ReadinessProbe.PeriodSeconds = 10
+		container.ReadinessProbe.TimeoutSeconds = 1
+		container.ReadinessProbe.FailureThreshold = 3
+
+		// StartupProbe verifies TSA is fully initialized by checking certificate chain endpoint
+		// This runs only at startup, allowing heavy checks without impacting ongoing probes
+		if container.StartupProbe == nil {
+			container.StartupProbe = &core.Probe{}
+		}
+		if container.StartupProbe.HTTPGet == nil {
+			container.StartupProbe.HTTPGet = &core.HTTPGetAction{}
+		}
+		container.StartupProbe.HTTPGet.Path = "/api/v1/timestamp/certchain"
+		container.StartupProbe.HTTPGet.Port = intstr.FromInt32(3000)
+		container.StartupProbe.PeriodSeconds = 5
+		container.StartupProbe.TimeoutSeconds = 5
+		container.StartupProbe.FailureThreshold = 12
+
+		return nil
 	}
 }

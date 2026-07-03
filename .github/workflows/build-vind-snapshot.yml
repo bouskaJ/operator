@@ -1,0 +1,172 @@
+name: Build vind Snapshots
+
+on:
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'ci/keycloak/**'
+      - 'ci/vcluster.yaml'
+      - '.github/workflows/build-vind-snapshot.yml'
+
+env:
+  SNAPSHOT_REGISTRY: ghcr.io/securesign/operator-vind-snapshot
+  VCLUSTER_VERSION: v0.35.1
+
+jobs:
+  build-full-snapshot:
+    name: Build full vind snapshot
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          auth_file_path: /tmp/config.json
+
+      - name: Sync registry auth to Docker config
+        run: |
+          mkdir -p ~/.docker
+          cp /tmp/config.json ~/.docker/config.json
+
+      - name: Install vCluster CLI
+        run: |
+          curl -fsSL "https://github.com/loft-sh/vcluster/releases/download/${{ env.VCLUSTER_VERSION }}/vcluster-linux-amd64" \
+            -o /usr/local/bin/vcluster
+          chmod +x /usr/local/bin/vcluster
+          vcluster --version
+
+      - name: Create vind cluster
+        run: |
+          vcluster use driver docker
+          vcluster create snapshot-builder \
+            --values ci/vcluster.yaml \
+            --kubernetes-version 1.35.0
+
+      - name: Install ingress-nginx
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.14.3/deploy/static/provider/kind/deploy.yaml
+          kubectl wait --namespace ingress-nginx \
+            --for=condition=ready pod \
+            --selector=app.kubernetes.io/component=controller \
+            --timeout=300s
+
+      - name: Install cert-manager
+        run: |
+          kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.20.2/cert-manager.yaml
+          kubectl wait --for=condition=Available deployment/cert-manager -n cert-manager --timeout=120s
+          kubectl wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=120s
+          kubectl wait --for=condition=Available deployment/cert-manager-cainjector -n cert-manager --timeout=120s
+
+      - name: Install Prometheus Operator
+        run: |
+          curl -sL https://github.com/prometheus-operator/prometheus-operator/releases/download/v0.84.0/bundle.yaml -o bundle.yaml
+          if [ ! -s "bundle.yaml" ]; then
+            echo "Error: Downloaded bundle.yaml is empty or failed to download."
+            exit 1
+          fi
+          kubectl create -f bundle.yaml
+          kubectl wait --for=condition=Ready pods -l app.kubernetes.io/name=prometheus-operator -n default --timeout=90s
+
+      - name: Install OLM
+        run: |
+          kubectl create -f https://github.com/operator-framework/operator-lifecycle-manager/releases/download/v0.32.0/crds.yaml
+          sleep 1
+          kubectl create -f https://github.com/operator-framework/operator-lifecycle-manager/releases/download/v0.32.0/olm.yaml
+          kubectl wait --for=condition=Available deployment/olm-operator -n olm --timeout=120s
+          kubectl wait --for=condition=Available deployment/catalog-operator -n olm --timeout=120s
+          kubectl delete catalogsource operatorhubio-catalog -n olm --ignore-not-found
+
+      - name: Install Keycloak
+        run: bash ci/keycloak/tas-keycloak-install.sh kind
+
+      - name: Verify all components are ready
+        run: |
+          echo "=== Cluster overview ==="
+          kubectl get nodes
+          kubectl get pods -A
+          echo "=== Checking key deployments ==="
+          kubectl get deploy -n ingress-nginx
+          kubectl get deploy -n cert-manager
+          kubectl get deploy -n olm
+          kubectl get deploy -n keycloak-system
+
+      - name: Snapshot full cluster
+        run: |
+          vcluster snapshot create snapshot-builder \
+            "oci://${{ env.SNAPSHOT_REGISTRY }}:full"
+
+      - name: Cleanup
+        if: always()
+        run: vcluster delete snapshot-builder --driver docker || true
+
+  build-minimal-snapshot:
+    name: Build minimal vind snapshot
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          auth_file_path: /tmp/config.json
+
+      - name: Sync registry auth to Docker config
+        run: |
+          mkdir -p ~/.docker
+          cp /tmp/config.json ~/.docker/config.json
+
+      - name: Install vCluster CLI
+        run: |
+          curl -fsSL "https://github.com/loft-sh/vcluster/releases/download/${{ env.VCLUSTER_VERSION }}/vcluster-linux-amd64" \
+            -o /usr/local/bin/vcluster
+          chmod +x /usr/local/bin/vcluster
+          vcluster --version
+
+      - name: Create vind cluster
+        run: |
+          vcluster use driver docker
+          vcluster create snapshot-builder-minimal \
+            --values ci/vcluster.yaml \
+            --kubernetes-version 1.35.0
+
+      - name: Install ingress-nginx
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.14.3/deploy/static/provider/kind/deploy.yaml
+          kubectl wait --namespace ingress-nginx \
+            --for=condition=ready pod \
+            --selector=app.kubernetes.io/component=controller \
+            --timeout=300s
+
+      - name: Install cert-manager
+        run: |
+          kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.20.2/cert-manager.yaml
+          kubectl wait --for=condition=Available deployment/cert-manager -n cert-manager --timeout=120s
+          kubectl wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=120s
+          kubectl wait --for=condition=Available deployment/cert-manager-cainjector -n cert-manager --timeout=120s
+
+      - name: Snapshot minimal cluster
+        run: |
+          vcluster snapshot create snapshot-builder-minimal \
+            "oci://${{ env.SNAPSHOT_REGISTRY }}:minimal"
+
+      - name: Cleanup
+        if: always()
+        run: vcluster delete snapshot-builder-minimal --driver docker || true

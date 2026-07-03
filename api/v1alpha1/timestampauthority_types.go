@@ -24,6 +24,7 @@ import (
 // TimestampAuthoritySpec defines the desired state of TimestampAuthority
 // +kubebuilder:validation:XValidation:rule=!(has(self.signer.certificateChain.certificateChainRef) && (has(self.signer.certificateChain.intermediateCA) || has(self.signer.certificateChain.leafCA) || has(self.signer.certificateChain.rootCA))),message="when certificateChainRef is set, intermediateCA, leafCA, and rootCA must not be set"
 type TimestampAuthoritySpec struct {
+	PodRequirements `json:",inline"`
 	//Define whether you want to export service or not
 	ExternalAccess ExternalAccess `json:"externalAccess,omitempty"`
 	//Signer configuration
@@ -37,6 +38,10 @@ type TimestampAuthoritySpec struct {
 	//Configuration for NTP monitoring
 	//+optional
 	NTPMonitoring NTPMonitoring `json:"ntpMonitoring,omitempty"`
+	// MaxRequestBodySize sets the maximum size in bytes for HTTP request body. Passed as --max-request-body-size.
+	//+kubebuilder:default:=1048576
+	//+optional
+	MaxRequestBodySize *int64 `json:"maxRequestBodySize,omitempty"`
 }
 
 // TimestampAuthoritySigner defines the desired state of the Timestamp Authority Signer
@@ -205,6 +210,20 @@ type TimestampAuthorityList struct {
 	Items           []TimestampAuthority `json:"items"`
 }
 
-func init() {
-	SchemeBuilder.Register(&TimestampAuthority{}, &TimestampAuthorityList{})
+func (i *TimestampAuthority) GetTrustedCA() *LocalObjectReference {
+	if i.Spec.TrustedCA != nil {
+		return i.Spec.TrustedCA
+	}
+
+	if v, ok := i.GetAnnotations()["rhtas.redhat.com/trusted-ca"]; ok {
+		return &LocalObjectReference{
+			Name: v,
+		}
+	}
+
+	return nil
+}
+
+func (i *TimestampAuthority) GetServiceURL() string {
+	return i.Status.Url
 }

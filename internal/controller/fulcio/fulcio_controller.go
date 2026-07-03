@@ -19,45 +19,48 @@ package fulcio
 import (
 	"context"
 
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/action/transitions"
+	"github.com/securesign/operator/internal/annotations"
+	"github.com/securesign/operator/internal/controller"
 	"k8s.io/apimachinery/pkg/types"
 
 	olpredicate "github.com/operator-framework/operator-lib/predicate"
-	"github.com/securesign/operator/internal/controller/annotations"
-	"github.com/securesign/operator/internal/controller/common/action/transitions"
-
 	"github.com/securesign/operator/internal/controller/fulcio/actions"
 	v12 "k8s.io/api/core/v1"
 	v13 "k8s.io/api/networking/v1"
-	"k8s.io/client-go/tools/record"
-
-	"github.com/securesign/operator/internal/controller/common/action"
+	"k8s.io/client-go/tools/events"
 
 	v1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/controller/predicate"
 )
 
-// FulcioReconciler reconciles a Fulcio object
-type FulcioReconciler struct {
+// fulcioReconciler reconciles a Fulcio object
+type fulcioReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	scheme   *runtime.Scheme
+	recorder events.EventRecorder
+}
+
+func NewReconciler(c client.Client, scheme *runtime.Scheme, recorder events.EventRecorder) controller.Controller {
+	return &fulcioReconciler{
+		Client:   c,
+		scheme:   scheme,
+		recorder: recorder,
+	}
 }
 
 //+kubebuilder:rbac:groups=rhtas.redhat.com,resources=fulcios,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=rhtas.redhat.com,resources=fulcios/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=rhtas.redhat.com,resources=fulcios/finalizers,verbs=update
-//+kubebuilder:rbac:groups=rhtas.redhat.com,resources=secrets,verbs=create;get;list;watch;update;patch;delete
-//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=create;get;list;watch;update;patch;delete
-//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=create;get;list;watch;update;patch;delete
-//+kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=create;get;list;watch;update;patch;delete
-//+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
-//+kubebuilder:rbac:groups="",resources=endpoints,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -68,12 +71,12 @@ type FulcioReconciler struct {
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.14.1/pkg/reconcile
-func (r *FulcioReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *fulcioReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 
-	var instance rhtasv1alpha1.Fulcio
+	var instance rhtasv1.Fulcio
 	log := ctrllog.FromContext(ctx)
 
-	if err := r.Client.Get(ctx, req.NamespacedName, &instance); err != nil {
+	if err := r.Get(ctx, req.NamespacedName, &instance); err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -90,26 +93,30 @@ func (r *FulcioReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	target := instance.DeepCopy()
-	acs := []action.Action[*rhtasv1alpha1.Fulcio]{
-		transitions.NewToPendingPhaseAction[*rhtasv1alpha1.Fulcio](func(_ *rhtasv1alpha1.Fulcio) []string {
-			return []string{actions.CertCondition}
-		}),
-		actions.NewHandleCertAction(),
-		transitions.NewToCreatePhaseAction[*rhtasv1alpha1.Fulcio](),
+	conditionSupplier := func(_ *rhtasv1.Fulcio) []string {
+		return []string{actions.CertCondition}
+	}
+	acs := []action.Action[*rhtasv1.Fulcio]{
+		transitions.NewToPendingPhaseAction[*rhtasv1.Fulcio](),
+		transitions.NewEnsureConditionsAction[*rhtasv1.Fulcio](conditionSupplier),
+		actions.NewGenerateSignerAction(),
+		transitions.NewToCreatePhaseAction[*rhtasv1.Fulcio](),
 		actions.NewRBACAction(),
 		actions.NewServerConfigAction(),
 		actions.NewDeployAction(),
 		actions.NewCreateMonitorAction(),
 		actions.NewServiceAction(),
 		actions.NewIngressAction(),
-		transitions.NewToInitializePhaseAction[*rhtasv1alpha1.Fulcio](),
+		actions.NewStatusUrlAction(),
+		transitions.NewToInitializePhaseAction[*rhtasv1.Fulcio](),
 		actions.NewInitializeAction(),
+		transitions.NewToReadyPhaseAction[*rhtasv1.Fulcio](),
 	}
 
 	for _, a := range acs {
 		a.InjectClient(r.Client)
 		a.InjectLogger(log.WithName(a.Name()))
-		a.InjectRecorder(r.Recorder)
+		a.InjectRecorder(r.recorder)
 
 		if a.CanHandle(ctx, target) {
 			log.V(2).Info("Executing " + a.Name())
@@ -123,16 +130,16 @@ func (r *FulcioReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *FulcioReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *fulcioReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Filter out with the pause annotation.
-	pause, err := olpredicate.NewPause(annotations.PausedReconciliation)
+	pause, err := olpredicate.NewPause[client.Object](annotations.PausedReconciliation)
 	if err != nil {
 		return err
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		WithEventFilter(pause).
-		For(&rhtasv1alpha1.Fulcio{}).
+		For(&rhtasv1.Fulcio{}, builder.WithPredicates(predicate.ConfigurationChangedOnFailurePredicate[*rhtasv1.Fulcio]())).
 		Owns(&v1.Deployment{}).
 		Owns(&v12.Service{}).
 		Owns(&v13.Ingress{}).

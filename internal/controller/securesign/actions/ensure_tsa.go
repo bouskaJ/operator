@@ -2,20 +2,26 @@ package actions
 
 import (
 	"context"
+	"fmt"
+	"maps"
 	"reflect"
+	"slices"
 
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/common/action"
-	"github.com/securesign/operator/internal/controller/constants"
-	"github.com/securesign/operator/internal/controller/labels"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/annotations"
+	"github.com/securesign/operator/internal/constants"
 	"github.com/securesign/operator/internal/controller/tsa/actions"
+	"github.com/securesign/operator/internal/labels"
+	"github.com/securesign/operator/internal/state"
+	"github.com/securesign/operator/internal/utils/kubernetes"
+	"github.com/securesign/operator/internal/utils/kubernetes/ensure"
 	"k8s.io/apimachinery/pkg/api/meta"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-func NewTsaAction() action.Action[*rhtasv1alpha1.Securesign] {
+func NewTsaAction() action.Action[*rhtasv1.Securesign] {
 	return &tsaAction{}
 }
 
@@ -27,78 +33,86 @@ func (i tsaAction) Name() string {
 	return "create tsa"
 }
 
-func (i tsaAction) CanHandle(context.Context, *rhtasv1alpha1.Securesign) bool {
+func (i tsaAction) CanHandle(context.Context, *rhtasv1.Securesign) bool {
 	return true
 }
 
-func (i tsaAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Securesign) *action.Result {
+func (i tsaAction) Handle(ctx context.Context, instance *rhtasv1.Securesign) *action.Result {
 	var (
-		err     error
-		updated bool
+		err    error
+		result controllerutil.OperationResult
+		l      = labels.For(actions.ComponentName, instance.Name, instance.Name)
+		tsa    = &rhtasv1.TimestampAuthority{
+			ObjectMeta: v1.ObjectMeta{
+				Name:      instance.Name,
+				Namespace: instance.Namespace,
+			},
+		}
 	)
-	tsa := &rhtasv1alpha1.TimestampAuthority{}
-	tsa.Name = instance.Name
-	tsa.Namespace = instance.Namespace
-	tsa.Labels = labels.For(actions.ComponentName, tsa.Name, instance.Name)
 
 	if reflect.ValueOf(instance.Spec.TimestampAuthority).IsZero() {
+		if meta.IsStatusConditionTrue(instance.Status.Conditions, TSACondition) {
+			return i.Continue()
+		}
 		meta.SetStatusCondition(&instance.Status.Conditions, v1.Condition{
 			Type:    TSACondition,
-			Status:  v1.ConditionFalse,
-			Reason:  constants.NotDefined,
+			Status:  v1.ConditionTrue,
+			Reason:  state.NotDefined.String(),
 			Message: "TSA resource is undefined",
 		})
-		return i.StatusUpdate(ctx, instance)
-	}
-	tsa.Spec = *instance.Spec.TimestampAuthority
-
-	if err = controllerutil.SetControllerReference(instance, tsa, i.Client.Scheme()); err != nil {
-		return i.Failed(err)
+		return i.ReturnOnChange(i.PersistStatus)(ctx, instance)
 	}
 
-	if updated, err = i.Ensure(ctx, tsa, action.EnsureSpec(), action.EnsureRouteSelectorLabels(), action.EnsureNTPConfig()); err != nil {
+	if result, err = kubernetes.CreateOrUpdate(ctx, i.Client,
+		tsa,
+		ensure.ControllerReference[*rhtasv1.TimestampAuthority](instance, i.Client),
+		ensure.Labels[*rhtasv1.TimestampAuthority](slices.Collect(maps.Keys(l)), l),
+		ensure.Annotations[*rhtasv1.TimestampAuthority](annotations.InheritableAnnotations, instance.Annotations),
+		func(object *rhtasv1.TimestampAuthority) error {
+			object.Spec = *instance.Spec.TimestampAuthority
+			return nil
+		},
+	); err != nil {
+		return i.Error(ctx, fmt.Errorf("could not create TimestampAuthority: %w", err), instance,
+			v1.Condition{
+				Type:    TSACondition,
+				Status:  v1.ConditionFalse,
+				Reason:  state.Failure.String(),
+				Message: err.Error(),
+			})
+	}
+
+	if result != controllerutil.OperationResultNone {
 		meta.SetStatusCondition(&instance.Status.Conditions, v1.Condition{
 			Type:    TSACondition,
 			Status:  v1.ConditionFalse,
-			Reason:  constants.Failure,
-			Message: err.Error(),
-		})
-		return i.FailedWithStatusUpdate(ctx, err, instance)
-	}
-
-	if updated {
-		meta.SetStatusCondition(&instance.Status.Conditions, v1.Condition{
-			Type:    TSACondition,
-			Status:  v1.ConditionFalse,
-			Reason:  constants.Creating,
+			Reason:  state.Creating.String(),
 			Message: "TSA resource created " + tsa.Name,
 		})
-		return i.StatusUpdate(ctx, instance)
+		return i.ReturnOnChange(i.PersistStatus)(ctx, instance)
 	}
 
-	return i.CopyStatus(ctx, client.ObjectKeyFromObject(tsa), instance)
+	return i.CopyStatus(ctx, tsa, instance)
 }
 
-func (i tsaAction) CopyStatus(ctx context.Context, ok client.ObjectKey, instance *rhtasv1alpha1.Securesign) *action.Result {
-	object := &rhtasv1alpha1.TimestampAuthority{}
-	if err := i.Client.Get(ctx, ok, object); err != nil {
-		return i.Failed(err)
-	}
-	objectStatus := meta.FindStatusCondition(object.Status.Conditions, constants.Ready)
+func (i tsaAction) CopyStatus(ctx context.Context, object *rhtasv1.TimestampAuthority, instance *rhtasv1.Securesign) *action.Result {
+	objectStatus := meta.FindStatusCondition(object.Status.Conditions, constants.ReadyCondition)
 	if objectStatus == nil {
 		// not initialized yet, wait for update
 		return i.Continue()
 	}
-	if !meta.IsStatusConditionPresentAndEqual(instance.Status.Conditions, TSACondition, objectStatus.Status) {
+	switch {
+	case !meta.IsStatusConditionPresentAndEqual(instance.Status.Conditions, TSACondition, objectStatus.Status):
 		meta.SetStatusCondition(&instance.Status.Conditions, v1.Condition{
 			Type:   TSACondition,
 			Status: objectStatus.Status,
 			Reason: objectStatus.Reason,
 		})
-		if objectStatus.Status == v1.ConditionTrue {
-			instance.Status.TSAStatus.Url = object.Status.Url
-		}
-		return i.StatusUpdate(ctx, instance)
+	case instance.Status.TSAStatus.Url != object.Status.Url:
+		instance.Status.TSAStatus.Url = object.Status.Url
+	default:
+		return i.Continue()
 	}
-	return i.Continue()
+
+	return i.ReturnOnChange(i.PersistStatus)(ctx, instance)
 }

@@ -1,0 +1,7 @@
+experimental:
+  docker:
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "/tmp/config.json:/var/lib/kubelet/config.json:ro"

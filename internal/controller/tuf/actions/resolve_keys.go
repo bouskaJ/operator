@@ -5,18 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"time"
 
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/common/action"
-	k8sutils "github.com/securesign/operator/internal/controller/common/utils/kubernetes"
-	"github.com/securesign/operator/internal/controller/constants"
-	"github.com/securesign/operator/internal/controller/labels"
-	"k8s.io/apimachinery/pkg/api/equality"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/constants"
+	"github.com/securesign/operator/internal/labels"
+	"github.com/securesign/operator/internal/state"
+	k8sutils "github.com/securesign/operator/internal/utils/kubernetes"
 	"k8s.io/apimachinery/pkg/api/meta"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func NewResolveKeysAction() action.Action[*rhtasv1alpha1.Tuf] {
+func NewResolveKeysAction() action.Action[*rhtasv1.Tuf] {
 	return &resolveKeysAction{}
 }
 
@@ -28,64 +29,70 @@ func (i resolveKeysAction) Name() string {
 	return "resolve keys"
 }
 
-func (i resolveKeysAction) CanHandle(ctx context.Context, instance *rhtasv1alpha1.Tuf) bool {
-	c := meta.FindStatusCondition(instance.Status.Conditions, constants.Ready)
-	if c.Reason != constants.Pending && c.Reason != constants.Ready {
+func (i resolveKeysAction) CanHandle(ctx context.Context, instance *rhtasv1.Tuf) bool {
+	if state.FromInstance(instance, constants.ReadyCondition) < state.Pending {
 		return false
 	}
-
-	return !equality.Semantic.DeepDerivative(instance.Spec.Keys, instance.Status.Keys)
+	return !instance.Status.MatchesKeys(instance.Spec.Keys)
 }
 
-func (i resolveKeysAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Tuf) *action.Result {
-	if meta.FindStatusCondition(instance.Status.Conditions, constants.Ready).Reason != constants.Pending {
-		meta.SetStatusCondition(&instance.Status.Conditions, v1.Condition{Type: constants.Ready,
-			Status: v1.ConditionFalse, Reason: constants.Pending, Message: "Resolving keys"})
+func (i resolveKeysAction) Handle(ctx context.Context, instance *rhtasv1.Tuf) *action.Result {
+	if state.FromInstance(instance, constants.ReadyCondition) != state.Pending {
+		meta.SetStatusCondition(&instance.Status.Conditions, v1.Condition{Type: constants.ReadyCondition,
+			Status: v1.ConditionFalse, Reason: state.Pending.String(), Message: "Resolving keys",
+			ObservedGeneration: instance.Generation})
 	}
 
-	if cap(instance.Status.Keys) < len(instance.Spec.Keys) {
-		instance.Status.Keys = make([]rhtasv1alpha1.TufKey, 0, len(instance.Spec.Keys))
+	if len(instance.Status.Keys) != len(instance.Spec.Keys) {
+		instance.Status.Keys = make([]rhtasv1.TufKeyStatus, 0, len(instance.Spec.Keys))
 	}
 	for index, key := range instance.Spec.Keys {
 		k, err := i.handleKey(ctx, instance, &key)
 		if err != nil {
-			meta.SetStatusCondition(&instance.Status.Conditions, v1.Condition{Type: constants.Ready,
-				Status: v1.ConditionFalse, Reason: constants.Pending, Message: "Resolving keys"})
+			meta.SetStatusCondition(&instance.Status.Conditions, v1.Condition{Type: constants.ReadyCondition,
+				Status: v1.ConditionFalse, Reason: state.Pending.String(), Message: "Resolving keys",
+				ObservedGeneration: instance.Generation})
 
 			meta.SetStatusCondition(&instance.Status.Conditions, v1.Condition{
 				Type:    key.Name,
 				Status:  v1.ConditionFalse,
-				Reason:  constants.Failure,
+				Reason:  state.Failure.String(),
 				Message: err.Error(),
 			})
-			i.StatusUpdate(ctx, instance)
-			return i.Requeue()
+			if _, err := i.PersistStatus(ctx, instance); err != nil {
+				return i.Error(ctx, err, instance)
+			}
+			return i.RequeueAfter(5 * time.Second)
 		}
+		ks := rhtasv1.TufKeyStatus{Name: k.Name, SecretRef: k.SecretRef}
 		if len(instance.Status.Keys) < index+1 {
-			instance.Status.Keys = append(instance.Status.Keys, *k)
+			instance.Status.Keys = append(instance.Status.Keys, ks)
 			meta.SetStatusCondition(&instance.Status.Conditions, v1.Condition{
 				Type:   key.Name,
 				Status: v1.ConditionTrue,
-				Reason: constants.Ready,
+				Reason: state.Ready.String(),
 			})
 		} else {
-			if !reflect.DeepEqual(*k, instance.Status.Keys[index]) {
-				instance.Status.Keys[index] = *k
+			if !reflect.DeepEqual(ks, instance.Status.Keys[index]) {
+				instance.Status.Keys[index] = ks
 				meta.SetStatusCondition(&instance.Status.Conditions, v1.Condition{
 					Type:   key.Name,
 					Status: v1.ConditionTrue,
-					Reason: constants.Ready,
+					Reason: state.Ready.String(),
 				})
 			}
 		}
 		if index == len(instance.Spec.Keys)-1 {
+			if _, err := i.PersistStatus(ctx, instance); err != nil {
+				return i.Error(ctx, err, instance)
+			}
 			return i.Continue()
 		}
 	}
-	return i.StatusUpdate(ctx, instance)
+	return i.Continue()
 }
 
-func (i resolveKeysAction) handleKey(ctx context.Context, instance *rhtasv1alpha1.Tuf, key *rhtasv1alpha1.TufKey) (*rhtasv1alpha1.TufKey, error) {
+func (i resolveKeysAction) handleKey(ctx context.Context, instance *rhtasv1.Tuf, key *rhtasv1.TufKey) (*rhtasv1.TufKey, error) {
 	switch {
 	case key.SecretRef == nil:
 		sks, err := i.discoverSecret(ctx, instance.Namespace, key)
@@ -101,7 +108,7 @@ func (i resolveKeysAction) handleKey(ctx context.Context, instance *rhtasv1alpha
 	}
 }
 
-func (i resolveKeysAction) discoverSecret(ctx context.Context, namespace string, key *rhtasv1alpha1.TufKey) (*rhtasv1alpha1.SecretKeySelector, error) {
+func (i resolveKeysAction) discoverSecret(ctx context.Context, namespace string, key *rhtasv1.TufKey) (*rhtasv1.SecretKeySelector, error) {
 	labelName := labels.LabelNamespace + "/" + key.Name
 	s, err := k8sutils.FindSecret(ctx, i.Client, namespace, labelName)
 	if err != nil {
@@ -113,9 +120,9 @@ func (i resolveKeysAction) discoverSecret(ctx context.Context, namespace string,
 			err = fmt.Errorf("label %s is empty", labelName)
 			return nil, err
 		}
-		return &rhtasv1alpha1.SecretKeySelector{
+		return &rhtasv1.SecretKeySelector{
 			Key: keySelector,
-			LocalObjectReference: rhtasv1alpha1.LocalObjectReference{
+			LocalObjectReference: rhtasv1.LocalObjectReference{
 				Name: s.Name,
 			},
 		}, nil

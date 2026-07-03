@@ -20,13 +20,13 @@ import (
 	"context"
 	"time"
 
+	"github.com/securesign/operator/internal/constants"
+	"github.com/securesign/operator/internal/state"
 	k8sTest "github.com/securesign/operator/internal/testing/kubernetes"
+	"github.com/securesign/operator/internal/utils"
 
-	"github.com/securesign/operator/internal/controller/common/utils"
-
-	"github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/constants"
-	actions "github.com/securesign/operator/internal/controller/trillian/actions"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/controller/trillian/actions"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 
@@ -57,139 +57,144 @@ var _ = Describe("Trillian controller", func() {
 		}
 
 		typeNamespaceName := types.NamespacedName{Name: Name, Namespace: Namespace}
-		trillian := &v1alpha1.Trillian{}
+		trillian := &rhtasv1.Trillian{}
 
 		BeforeEach(func() {
 			By("Creating the Namespace to perform the tests")
-			err := k8sClient.Create(ctx, namespace)
+			err := suite.Client().Create(ctx, namespace)
 			Expect(err).To(Not(HaveOccurred()))
 		})
 
 		AfterEach(func() {
 			By("removing the custom resource for the Kind Trillian")
-			found := &v1alpha1.Trillian{}
-			err := k8sClient.Get(ctx, typeNamespaceName, found)
+			found := &rhtasv1.Trillian{}
+			err := suite.Client().Get(ctx, typeNamespaceName, found)
 			Expect(err).To(Not(HaveOccurred()))
 
 			Eventually(func() error {
-				return k8sClient.Delete(context.TODO(), found)
+				return suite.Client().Delete(context.TODO(), found)
 			}, 2*time.Minute, time.Second).Should(Succeed())
 
 			// TODO(user): Attention if you improve this code by adding other context test you MUST
 			// be aware of the current delete namespace limitations.
 			// More info: https://book.kubebuilder.io/reference/envtest.html#testing-considerations
 			By("Deleting the Namespace to perform the tests")
-			_ = k8sClient.Delete(ctx, namespace)
+			_ = suite.Client().Delete(ctx, namespace)
 		})
 
 		It("should successfully reconcile a custom resource for Trillian", func() {
 			By("creating the custom resource for the Kind Trillian")
-			err := k8sClient.Get(ctx, typeNamespaceName, trillian)
+			err := suite.Client().Get(ctx, typeNamespaceName, trillian)
 			if err != nil && errors.IsNotFound(err) {
 				// Let's mock our custom resource at the same way that we would
 				// apply on the cluster the manifest under config/samples
-				trillian := &v1alpha1.Trillian{
+				trillian := &rhtasv1.Trillian{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      Name,
 						Namespace: Namespace,
 					},
-					Spec: v1alpha1.TrillianSpec{
-						Db: v1alpha1.TrillianDB{
+					Spec: rhtasv1.TrillianSpec{
+						Db: rhtasv1.TrillianDB{
 							Create: utils.Pointer(true),
+						},
+						Monitoring: rhtasv1.MonitoringConfig{
+							Enabled: utils.Pointer(false),
 						},
 					},
 				}
-				err = k8sClient.Create(ctx, trillian)
+				err = suite.Client().Create(ctx, trillian)
 				Expect(err).To(Not(HaveOccurred()))
 			}
 
 			By("Checking if the custom resource was successfully created")
 			Eventually(func() error {
-				found := &v1alpha1.Trillian{}
-				return k8sClient.Get(ctx, typeNamespaceName, found)
+				found := &rhtasv1.Trillian{}
+				return suite.Client().Get(ctx, typeNamespaceName, found)
 			}).Should(Succeed())
 
 			By("Status conditions are initialized")
 			Eventually(func(g Gomega) bool {
-				found := &v1alpha1.Trillian{}
-				g.Expect(k8sClient.Get(ctx, typeNamespaceName, found)).Should(Succeed())
-				return meta.IsStatusConditionPresentAndEqual(found.Status.Conditions, constants.Ready, metav1.ConditionFalse)
+				found := &rhtasv1.Trillian{}
+				g.Expect(suite.Client().Get(ctx, typeNamespaceName, found)).Should(Succeed())
+				return meta.IsStatusConditionPresentAndEqual(found.Status.Conditions, constants.ReadyCondition, metav1.ConditionFalse)
 			}).Should(BeTrue())
-			found := &v1alpha1.Trillian{}
+			found := &rhtasv1.Trillian{}
 
 			By("Database secret created")
-			Eventually(func(g Gomega) *v1alpha1.LocalObjectReference {
-				g.Expect(k8sClient.Get(ctx, typeNamespaceName, found)).Should(Succeed())
+			Eventually(func(g Gomega) *rhtasv1.LocalObjectReference {
+				g.Expect(suite.Client().Get(ctx, typeNamespaceName, found)).Should(Succeed())
 				return found.Status.Db.DatabaseSecretRef
 			}).Should(Not(BeNil()))
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: found.Status.Db.DatabaseSecretRef.Name, Namespace: Namespace}, &corev1.Secret{})).Should(Succeed())
+			Expect(suite.Client().Get(ctx, types.NamespacedName{Name: found.Status.Db.DatabaseSecretRef.Name, Namespace: Namespace}, &corev1.Secret{})).Should(Succeed())
 
 			By("Database PVC created")
 			Eventually(func(g Gomega) string {
-				g.Expect(k8sClient.Get(ctx, typeNamespaceName, found)).Should(Succeed())
-				return found.Status.Db.Pvc.Name
+				g.Expect(suite.Client().Get(ctx, typeNamespaceName, found)).Should(Succeed())
+				return found.Status.Db.PvcName
 			}).Should(Not(BeEmpty()))
 
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: found.Status.Db.Pvc.Name, Namespace: Namespace}, &corev1.PersistentVolumeClaim{})).Should(Succeed())
+			Expect(suite.Client().Get(ctx, types.NamespacedName{Name: found.Status.Db.PvcName, Namespace: Namespace}, &corev1.PersistentVolumeClaim{})).Should(Succeed())
 
 			By("Database SVC created")
 			Eventually(func() error {
-				return k8sClient.Get(ctx, types.NamespacedName{Name: "trillian-mysql", Namespace: Namespace}, &corev1.Service{})
+				return suite.Client().Get(ctx, types.NamespacedName{Name: "trillian-mysql", Namespace: Namespace}, &corev1.Service{})
 			}).Should(Succeed())
 
 			By("Database Deployment created")
 			Eventually(func() error {
-				return k8sClient.Get(ctx, types.NamespacedName{Name: actions.DbDeploymentName, Namespace: Namespace}, &appsv1.Deployment{})
+				return suite.Client().Get(ctx, types.NamespacedName{Name: actions.DbDeploymentName, Namespace: Namespace}, &appsv1.Deployment{})
 			}).Should(Succeed())
 
 			By("LogServer Deployment created")
 			Eventually(func() error {
-				return k8sClient.Get(ctx, types.NamespacedName{Name: actions.LogserverDeploymentName, Namespace: Namespace}, &appsv1.Deployment{})
+				return suite.Client().Get(ctx, types.NamespacedName{Name: actions.LogserverDeploymentName, Namespace: Namespace}, &appsv1.Deployment{})
 			}).Should(Succeed())
 
 			By("LogServerSvc Deployment created")
 			Eventually(func() error {
-				return k8sClient.Get(ctx, types.NamespacedName{Name: actions.LogserverDeploymentName, Namespace: Namespace}, &corev1.Service{})
+				return suite.Client().Get(ctx, types.NamespacedName{Name: actions.LogserverDeploymentName, Namespace: Namespace}, &corev1.Service{})
 			}).Should(Succeed())
 
 			By("LogSigner Deployment created")
 			Eventually(func() error {
-				return k8sClient.Get(ctx, types.NamespacedName{Name: actions.LogsignerDeploymentName, Namespace: Namespace}, &appsv1.Deployment{})
+				return suite.Client().Get(ctx, types.NamespacedName{Name: actions.LogsignerDeploymentName, Namespace: Namespace}, &appsv1.Deployment{})
 			}).Should(Succeed())
 
 			By("Waiting until Trillian instance is Initialization")
 			Eventually(func(g Gomega) string {
-				found := &v1alpha1.Trillian{}
-				g.Expect(k8sClient.Get(ctx, typeNamespaceName, found)).Should(Succeed())
-				return meta.FindStatusCondition(found.Status.Conditions, constants.Ready).Reason
-			}).Should(Equal(constants.Initialize))
+				found := &rhtasv1.Trillian{}
+				g.Expect(suite.Client().Get(ctx, typeNamespaceName, found)).Should(Succeed())
+				cond := meta.FindStatusCondition(found.Status.Conditions, constants.ReadyCondition)
+				g.Expect(cond).ToNot(BeNil())
+				return cond.Reason
+			}).Should(Equal(state.Initialize.String()))
 
 			By("Move to Ready phase")
 			// Workaround to succeed condition for Ready phase
 			deployments := &appsv1.DeploymentList{}
-			Expect(k8sClient.List(ctx, deployments, runtimeClient.InNamespace(Namespace))).To(Succeed())
+			Expect(suite.Client().List(ctx, deployments, runtimeClient.InNamespace(Namespace))).To(Succeed())
 			for _, d := range deployments.Items {
-				Expect(k8sTest.SetDeploymentToReady(ctx, k8sClient, &d)).To(Succeed())
+				Expect(k8sTest.SetDeploymentToReady(ctx, suite.Client(), &d)).To(Succeed())
 			}
 
 			By("Waiting until Trillian instance is Ready")
 			Eventually(func(g Gomega) bool {
-				found := &v1alpha1.Trillian{}
-				g.Expect(k8sClient.Get(ctx, typeNamespaceName, found)).Should(Succeed())
-				return meta.IsStatusConditionTrue(found.Status.Conditions, constants.Ready)
+				found := &rhtasv1.Trillian{}
+				g.Expect(suite.Client().Get(ctx, typeNamespaceName, found)).Should(Succeed())
+				return meta.IsStatusConditionTrue(found.Status.Conditions, constants.ReadyCondition)
 			}).Should(BeTrue())
 
 			By("Checking if controller will return deployment to desired state")
 			deployment := &appsv1.Deployment{}
 			Eventually(func() error {
-				return k8sClient.Get(ctx, types.NamespacedName{Name: actions.LogserverDeploymentName, Namespace: Namespace}, deployment)
+				return suite.Client().Get(ctx, types.NamespacedName{Name: actions.LogserverDeploymentName, Namespace: Namespace}, deployment)
 			}).Should(Succeed())
 			replicas := int32(99)
 			deployment.Spec.Replicas = &replicas
-			Expect(k8sClient.Status().Update(ctx, deployment)).Should(Succeed())
+			Expect(suite.Client().Status().Update(ctx, deployment)).Should(Succeed())
 			Eventually(func(g Gomega) int32 {
 				deployment = &appsv1.Deployment{}
-				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: actions.LogserverDeploymentName, Namespace: Namespace}, deployment)).Should(Succeed())
+				g.Expect(suite.Client().Get(ctx, types.NamespacedName{Name: actions.LogserverDeploymentName, Namespace: Namespace}, deployment)).Should(Succeed())
 				return *deployment.Spec.Replicas
 			}).Should(Equal(int32(1)))
 		})

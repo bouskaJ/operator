@@ -19,18 +19,16 @@ package securesign
 import (
 	"context"
 
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/annotations"
+	"github.com/securesign/operator/internal/controller"
 	v12 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 
 	"github.com/operator-framework/operator-lib/predicate"
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/annotations"
-	"github.com/securesign/operator/internal/controller/common/action"
-	"github.com/securesign/operator/internal/controller/constants"
-	"github.com/securesign/operator/internal/controller/labels"
+	rhtasv1 "github.com/securesign/operator/api/v1"
 	"github.com/securesign/operator/internal/controller/securesign/actions"
-	v1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -43,46 +41,31 @@ const (
 	finalizer = "tas.rhtas.redhat.com"
 )
 
-// SecuresignReconciler reconciles a Securesign object
-type SecuresignReconciler struct {
+// securesignReconciler reconciles a Securesign object
+type securesignReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	scheme   *runtime.Scheme
+	recorder events.EventRecorder
+}
+
+func NewReconciler(c client.Client, scheme *runtime.Scheme, recorder events.EventRecorder) controller.Controller {
+	return &securesignReconciler{
+		Client:   c,
+		scheme:   scheme,
+		recorder: recorder,
+	}
 }
 
 //+kubebuilder:rbac:groups=rhtas.redhat.com,resources=securesigns,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=rhtas.redhat.com,resources=securesigns/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=rhtas.redhat.com,resources=securesigns/finalizers,verbs=update
-//+kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=operator.openshift.io,resources=ingresscontrollers,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete;deletecollection
-//+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
-//+kubebuilder:rbac:groups=networking,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=core,resources=persistentvolumeclaims/finalizers,verbs=update
-//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=get;list;watch;create;update;patch;delete;deletecollection
-//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=get;list;watch;create;update;patch;delete;deletecollection
-//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch;delete;deletecollection
-//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete;deletecollection
-//+kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete;deletecollection
-//+kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=create;get;list;watch;update;patch;delete
-//+kubebuilder:rbac:groups=monitoring.coreos.com,resources=prometheuses/api,verbs=get;create;update
-//+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
-//+kubebuilder:rbac:groups="",resources=endpoints,verbs=get;list;watch
-//+kubebuilder:rbac:groups="",resources=events,verbs=create;get;list;watch;update;patch
-//+kubebuilder:rbac:groups="operator.openshift.io",resources=consoles,verbs=get;list
 
 // TODO: rework Securesign controller to watch resources
-func (r *SecuresignReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	var instance rhtasv1alpha1.Securesign
+func (r *securesignReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var instance rhtasv1.Securesign
 	log := ctrllog.FromContext(ctx)
 
-	if err := r.Client.Get(ctx, req.NamespacedName, &instance); err != nil {
+	if err := r.Get(ctx, req.NamespacedName, &instance); err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -101,21 +84,6 @@ func (r *SecuresignReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	if instance.DeletionTimestamp != nil {
-		instanceLabels := labels.For(actions.SegmentBackupJobName, actions.SegmentBackupCronJobName, instance.Name)
-		instanceLabels[labels.LabelAppNamespace] = instance.Namespace
-		if err := r.Client.DeleteAllOf(ctx, &v1.ClusterRoleBinding{}, client.MatchingLabels(instanceLabels)); err != nil {
-			log.Error(err, "problem with removing clusterRoleBinding resource")
-		}
-		if err := r.Client.DeleteAllOf(ctx, &v1.ClusterRole{}, client.MatchingLabels(instanceLabels)); err != nil {
-			log.Error(err, "problem with removing ClusterRole resource")
-		}
-		if err := r.Client.DeleteAllOf(ctx, &v1.Role{}, client.InNamespace(actions.OpenshiftMonitoringNS), client.MatchingLabels(instanceLabels)); err != nil {
-			log.Error(err, "problem with removing Role resource in %s", actions.OpenshiftMonitoringNS)
-		}
-		if err := r.Client.DeleteAllOf(ctx, &v1.RoleBinding{}, client.InNamespace(actions.OpenshiftMonitoringNS), client.MatchingLabels(instanceLabels)); err != nil {
-			log.Error(err, "problem with removing RoleBinding resource in %s", actions.OpenshiftMonitoringNS)
-		}
-
 		controllerutil.RemoveFinalizer(target, finalizer)
 		return ctrl.Result{}, r.Update(ctx, target)
 	}
@@ -126,10 +94,9 @@ func (r *SecuresignReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, nil
 	}
 
-	acs := []action.Action[*rhtasv1alpha1.Securesign]{
+	acs := []action.Action[*rhtasv1.Securesign]{
 		actions.NewInitializeStatusAction(),
 		actions.NewSBJRBACAction(),
-		actions.NewSegmentBackupJobAction(),
 		actions.NewSegmentBackupCronJobAction(),
 		actions.NewTrillianAction(),
 		actions.NewFulcioAction(),
@@ -144,12 +111,6 @@ func (r *SecuresignReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		a.InjectClient(r.Client)
 		a.InjectLogger(log.WithName(a.Name()))
 
-		if a.Name() == actions.SegmentBackupJobName {
-			if c := meta.FindStatusCondition(instance.GetConditions(), actions.MetricsCondition); c != nil && c.Reason == constants.Creating {
-				continue
-			}
-		}
-
 		if a.CanHandle(ctx, target) {
 			result := a.Handle(ctx, target)
 			if result != nil {
@@ -161,21 +122,21 @@ func (r *SecuresignReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *SecuresignReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *securesignReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Filter out with the pause annotation.
-	pause, err := predicate.NewPause(annotations.PausedReconciliation)
+	pause, err := predicate.NewPause[client.Object](annotations.PausedReconciliation)
 	if err != nil {
 		return err
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		WithEventFilter(pause).
-		For(&rhtasv1alpha1.Securesign{}).
-		Owns(&rhtasv1alpha1.Fulcio{}).
-		Owns(&rhtasv1alpha1.Rekor{}).
-		Owns(&rhtasv1alpha1.Tuf{}).
-		Owns(&rhtasv1alpha1.Trillian{}).
-		Owns(&rhtasv1alpha1.CTlog{}).
-		Owns(&rhtasv1alpha1.TimestampAuthority{}).
+		For(&rhtasv1.Securesign{}).
+		Owns(&rhtasv1.Fulcio{}).
+		Owns(&rhtasv1.Rekor{}).
+		Owns(&rhtasv1.Tuf{}).
+		Owns(&rhtasv1.Trillian{}).
+		Owns(&rhtasv1.CTlog{}).
+		Owns(&rhtasv1.TimestampAuthority{}).
 		Complete(r)
 }

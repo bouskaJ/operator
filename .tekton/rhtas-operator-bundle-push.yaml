@@ -6,13 +6,13 @@ metadata:
     build.appstudio.redhat.com/commit_sha: '{{revision}}'
     build.appstudio.redhat.com/target_branch: '{{target_branch}}'
     pipelinesascode.tekton.dev/max-keep-runs: "3"
-    pipelinesascode.tekton.dev/on-cel-expression: event == "push" && target_branch == "main" &&
-      ("bundle/***".pathChanged() ||
-      ".tekton/bundle-build-pipeline.yaml".pathChanged() ||
-      ".tekton/rhtas-operator-bundle-push.yaml".pathChanged() ||
-      "bundle.Dockerfile".pathChanged() ||
-      "trigger-konflux-builds.txt".pathChanged())
-    build.appstudio.openshift.io/build-nudge-files: "internal/controller/constants/*"
+    pipelinesascode.tekton.dev/on-cel-expression: event == "push" && target_branch
+      == "main" && (".tekton/rhtas-operator-bundle-push.yaml".pathChanged() || ".tekton/rhtas-operator-push.yaml".pathChanged()
+      || "bundle.Dockerfile".pathChanged() || "Dockerfile.rhtas-operator.rh".pathChanged()
+      || "config/***".pathChanged() || "hack/***".pathChanged()
+      || "api/***".pathChanged() || "internal/***".pathChanged() || "cmd/***".pathChanged()
+      || "test/***".pathChanged() || "ci/***".pathChanged()
+      || "go.mod".pathChanged() || "go.sum".pathChanged())
   creationTimestamp: null
   labels:
     appstudio.openshift.io/application: operator
@@ -22,26 +22,41 @@ metadata:
   namespace: rhtas-tenant
 spec:
   params:
-    - name: git-url
-      value: '{{source_url}}'
-    - name: revision
-      value: '{{revision}}'
-    - name: output-image
-      value: quay.io/securesign/rhtas-operator-bundle:{{revision}}
-    - name: dockerfile
-      value: bundle.Dockerfile
-    - name: path-context
-      value: .
-    - name: build-source-image
-      value: "true"
-    - name: hermetic
-      value: "true"
-    - name: prefetch-input
-      value: ''
+  - name: release-version
+    value: "1.5.0"
+  - name: git-url
+    value: '{{source_url}}'
+  - name: revision
+    value: '{{revision}}'
+  - name: output-image
+    value: quay.io/securesign/rhtas-operator-bundle:{{revision}}
+  - name: dockerfile
+    value: bundle.Dockerfile
+  - name: path-context
+    value: .
+  - name: build-source-image
+    value: "true"
+  - name: hermetic
+    value: "true"
+  - name: manager-pipelinerun-selector
+    value: appstudio.openshift.io/application=operator,appstudio.openshift.io/component=rhtas-operator,pipelinesascode.tekton.dev/sha={{revision}},pipelinesascode.tekton.dev/event-type in (push,incoming,retest-all-comment)
+  - name: manager-registry-url
+    value: registry.redhat.io/rhtas/rhtas-rhel9-operator
+  - name: fips-check
+    value: "true"
   pipelineRef:
-    name: bundle-build-pipeline
-  taskRunTemplate: {}
+    params:
+    - name: url
+      value: https://github.com/securesign/pipelines.git
+    - name: revision
+      value: main
+    - name: pathInRepo
+      value: pipelines/bundle-build-oci-ta.yaml
+    resolver: git
+  taskRunTemplate:
+    serviceAccountName: build-pipeline-rhtas-operator-bundle
   workspaces:
-    - name: git-auth
-      secret:
-        secretName: '{{ git_auth_secret }}'
+  - name: git-auth
+    secret:
+      secretName: '{{ git_auth_secret }}'
+status: {}

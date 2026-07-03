@@ -1,36 +1,58 @@
+version: "2"
 run:
-  deadline: 5m
-  allow-parallel-runners: true
   build-tags:
     - integration
     - upgrade
     - custom_install
-
-issues:
-  # don't skip warning about doc comments
-  # don't exclude the default set of lint
-  exclude-use-default: false
-  # restore some of the defaults
-  # (fill in the rest as needed)
-
+  allow-parallel-runners: true
 linters:
-  disable-all: true
+  default: none
   enable:
+    - actionlint
+    - copyloopvar
     - errcheck
-    - exportloopref
     - ginkgolinter
     - goconst
     - gocyclo
-    - gofmt
-    - goimports
-    - gosimple
     - govet
     - ineffassign
     - misspell
     - nakedret
     - prealloc
     - staticcheck
-    - typecheck
     - unconvert
     - unparam
     - unused
+  settings:
+    custom:
+      actionlint:
+        type: "module"
+        description: "Checks action framework patterns (PersistStatus errors, Spec mutations)"
+    staticcheck:
+      dot-import-whitelist:
+        - github.com/onsi/gomega
+        - github.com/onsi/ginkgo/v2
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+    rules:
+      # TODO: Migrate to GetEventRecorder - https://issues.redhat.com/browse/SECURESIGN-3651
+      - linters:
+          - staticcheck
+        text: "SA1019: manager.GetEventRecorderFor is deprecated"
+      - linters:
+          - goconst
+        path: (_test\.go$|^test/|^internal/testing/)
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

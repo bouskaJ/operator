@@ -19,40 +19,51 @@ package trillian
 import (
 	"context"
 
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/action/transitions"
+	"github.com/securesign/operator/internal/annotations"
+	"github.com/securesign/operator/internal/controller"
 	"k8s.io/apimachinery/pkg/types"
 
 	olpredicate "github.com/operator-framework/operator-lib/predicate"
-	"github.com/securesign/operator/internal/controller/annotations"
-	"github.com/securesign/operator/internal/controller/common/action/transitions"
-
-	"github.com/securesign/operator/internal/controller/common/action"
 	"github.com/securesign/operator/internal/controller/trillian/actions"
 	"github.com/securesign/operator/internal/controller/trillian/actions/db"
 	"github.com/securesign/operator/internal/controller/trillian/actions/logserver"
 	"github.com/securesign/operator/internal/controller/trillian/actions/logsigner"
 	v12 "k8s.io/api/core/v1"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 
 	v1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	tasPredicate "github.com/securesign/operator/internal/controller/predicate"
 )
 
-// TrillianReconciler reconciles a Trillian object
-type TrillianReconciler struct {
+// trillianReconciler reconciles a Trillian object
+type trillianReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	scheme   *runtime.Scheme
+	recorder events.EventRecorder
+}
+
+func NewReconciler(c client.Client, scheme *runtime.Scheme, recorder events.EventRecorder) controller.Controller {
+	return &trillianReconciler{
+		Client:   c,
+		scheme:   scheme,
+		recorder: recorder,
+	}
 }
 
 //+kubebuilder:rbac:groups=rhtas.redhat.com,resources=trillians,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=rhtas.redhat.com,resources=trillians/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=rhtas.redhat.com,resources=trillians/finalizers,verbs=update
+//+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;watch;create;update;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -63,12 +74,12 @@ type TrillianReconciler struct {
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.14.1/pkg/reconcile
-func (r *TrillianReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *trillianReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	// Fetch the Trillian instance
-	var instance rhtasv1alpha1.Trillian
+	var instance rhtasv1.Trillian
 	log := ctrllog.FromContext(ctx)
 
-	if err := r.Client.Get(ctx, req.NamespacedName, &instance); err != nil {
+	if err := r.Get(ctx, req.NamespacedName, &instance); err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -85,13 +96,21 @@ func (r *TrillianReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	target := instance.DeepCopy()
-	actions := []action.Action[*rhtasv1alpha1.Trillian]{
-		transitions.NewToPendingPhaseAction[*rhtasv1alpha1.Trillian](func(t *rhtasv1alpha1.Trillian) []string {
-			return []string{actions.ServerCondition, actions.SignerCondition, actions.DbCondition}
-		}),
+	conditionSupplier := func(_ *rhtasv1.Trillian) []string {
+		return []string{actions.ServerCondition, actions.SignerCondition, actions.DbCondition}
+	}
+	actions := []action.Action[*rhtasv1.Trillian]{
+		transitions.NewToPendingPhaseAction[*rhtasv1.Trillian](),
+		transitions.NewEnsureConditionsAction[*rhtasv1.Trillian](conditionSupplier),
 
-		transitions.NewToCreatePhaseAction[*rhtasv1alpha1.Trillian](),
-		actions.NewRBACAction(),
+		logserver.NewTlsAction(),
+		logsigner.NewTlsAction(),
+		db.NewTlsAction(),
+
+		transitions.NewToCreatePhaseAction[*rhtasv1.Trillian](),
+		logserver.NewRBACAction(),
+		logsigner.NewRBACAction(),
+		db.NewRBACAction(),
 
 		db.NewHandleSecretAction(),
 		db.NewCreatePvcAction(),
@@ -106,18 +125,19 @@ func (r *TrillianReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		logsigner.NewCreateServiceAction(),
 		logsigner.NewCreateMonitorAction(),
 
-		transitions.NewToInitializePhaseAction[*rhtasv1alpha1.Trillian](),
+		transitions.NewToInitializePhaseAction[*rhtasv1.Trillian](),
 
 		db.NewInitializeAction(),
 		logserver.NewInitializeAction(),
 		logsigner.NewInitializeAction(),
-		actions.NewInitializeAction(),
+
+		transitions.NewToReadyPhaseAction[*rhtasv1.Trillian](),
 	}
 
 	for _, a := range actions {
 		a.InjectClient(r.Client)
 		a.InjectLogger(log.WithName(a.Name()))
-		a.InjectRecorder(r.Recorder)
+		a.InjectRecorder(r.recorder)
 
 		if a.CanHandle(ctx, target) {
 			log.V(2).Info("Executing " + a.Name())
@@ -131,16 +151,16 @@ func (r *TrillianReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *TrillianReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *trillianReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Filter out with the pause annotation.
-	pause, err := olpredicate.NewPause(annotations.PausedReconciliation)
+	pause, err := olpredicate.NewPause[client.Object](annotations.PausedReconciliation)
 	if err != nil {
 		return err
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		WithEventFilter(pause).
-		For(&rhtasv1alpha1.Trillian{}).
+		For(&rhtasv1.Trillian{}, builder.WithPredicates(tasPredicate.ConfigurationChangedOnFailurePredicate[*rhtasv1.Trillian]())).
 		Owns(&v1.Deployment{}).
 		Owns(&v12.Service{}).
 		Complete(r)

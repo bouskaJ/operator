@@ -4,17 +4,18 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/constants"
+	"github.com/securesign/operator/internal/state"
 	v12 "k8s.io/api/networking/v1"
 
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/common/action"
-	"github.com/securesign/operator/internal/controller/constants"
+	rhtasv1 "github.com/securesign/operator/api/v1"
 	"github.com/securesign/operator/internal/controller/rekor/actions"
-	"k8s.io/apimachinery/pkg/api/meta"
+	"github.com/securesign/operator/internal/utils"
 	"k8s.io/apimachinery/pkg/types"
 )
 
-func NewStatusUrlAction() action.Action[*rhtasv1alpha1.Rekor] {
+func NewStatusUrlAction() action.Action[*rhtasv1.Rekor] {
 	return &statusUrlAction{}
 }
 
@@ -26,19 +27,18 @@ func (i statusUrlAction) Name() string {
 	return "status url"
 }
 
-func (i statusUrlAction) CanHandle(_ context.Context, instance *rhtasv1alpha1.Rekor) bool {
-	c := meta.FindStatusCondition(instance.Status.Conditions, constants.Ready)
-	return c.Reason == constants.Creating || c.Reason == constants.Ready
+func (i statusUrlAction) CanHandle(_ context.Context, instance *rhtasv1.Rekor) bool {
+	return state.FromInstance(instance, constants.ReadyCondition) >= state.Creating
 }
 
-func (i statusUrlAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Rekor) *action.Result {
+func (i statusUrlAction) Handle(ctx context.Context, instance *rhtasv1.Rekor) *action.Result {
 	var url string
-	if instance.Spec.ExternalAccess.Enabled {
+	if utils.IsEnabled(instance.Spec.ExternalAccess.Enabled) {
 		protocol := "http://"
 		ingress := &v12.Ingress{}
 		err := i.Client.Get(ctx, types.NamespacedName{Name: actions.ServerDeploymentName, Namespace: instance.Namespace}, ingress)
 		if err != nil {
-			return i.Failed(err)
+			return i.Error(ctx, err, instance)
 		}
 		if len(ingress.Spec.TLS) > 0 {
 			protocol = "https://"
@@ -53,5 +53,5 @@ func (i statusUrlAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Rek
 	}
 
 	instance.Status.Url = url
-	return i.StatusUpdate(ctx, instance)
+	return i.ReturnOnChange(i.PersistStatus)(ctx, instance)
 }

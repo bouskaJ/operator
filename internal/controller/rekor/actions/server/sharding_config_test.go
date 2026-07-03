@@ -6,12 +6,12 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/common/action"
-	"github.com/securesign/operator/internal/controller/common/utils/kubernetes"
-	"github.com/securesign/operator/internal/controller/constants"
-	"github.com/securesign/operator/internal/controller/labels"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/constants"
 	"github.com/securesign/operator/internal/controller/rekor/actions"
+	"github.com/securesign/operator/internal/labels"
+	"github.com/securesign/operator/internal/state"
 	testAction "github.com/securesign/operator/internal/testing/action"
 	"github.com/securesign/operator/internal/testing/errors"
 	v1 "k8s.io/api/core/v1"
@@ -26,37 +26,37 @@ import (
 func TestShardingConfig_CanHandle(t *testing.T) {
 	tests := []struct {
 		name      string
-		phase     string
+		phase     state.State
 		canHandle bool
 	}{
 		{
 			name:      "no phase condition",
-			phase:     "",
+			phase:     state.None,
 			canHandle: false,
 		},
 		{
-			name:      constants.Ready,
-			phase:     constants.Ready,
+			name:      constants.ReadyCondition,
+			phase:     state.Ready,
 			canHandle: true,
 		},
 		{
-			name:      constants.Pending,
-			phase:     constants.Pending,
+			name:      state.Pending.String(),
+			phase:     state.Pending,
 			canHandle: false,
 		},
 		{
-			name:      constants.Creating,
-			phase:     constants.Creating,
+			name:      state.Creating.String(),
+			phase:     state.Creating,
 			canHandle: true,
 		},
 		{
-			name:      constants.Initialize,
-			phase:     constants.Initialize,
-			canHandle: false,
+			name:      state.Initialize.String(),
+			phase:     state.Initialize,
+			canHandle: true,
 		},
 		{
-			name:      constants.Failure,
-			phase:     constants.Failure,
+			name:      state.Failure.String(),
+			phase:     state.Failure,
 			canHandle: false,
 		},
 	}
@@ -64,9 +64,9 @@ func TestShardingConfig_CanHandle(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := testAction.FakeClientBuilder().Build()
 			a := testAction.PrepareAction(c, NewShardingConfigAction())
-			instance := rhtasv1alpha1.Rekor{
-				Spec: rhtasv1alpha1.RekorSpec{
-					Sharding: []rhtasv1alpha1.RekorLogRange{
+			instance := rhtasv1.Rekor{
+				Spec: rhtasv1.RekorSpec{
+					Sharding: []rhtasv1.RekorLogRange{
 						{
 							TreeID:     123456,
 							TreeLength: 1,
@@ -74,10 +74,10 @@ func TestShardingConfig_CanHandle(t *testing.T) {
 					},
 				},
 			}
-			if tt.phase != "" {
+			if tt.phase != state.None {
 				meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-					Type:   actions.ServerCondition,
-					Reason: tt.phase,
+					Type:   constants.ReadyCondition,
+					Reason: tt.phase.String(),
 				})
 			}
 
@@ -95,9 +95,9 @@ func TestShardingConfig_Handle(t *testing.T) {
 	shardingConfigLabels[labels.LabelResource] = shardingConfigLabel
 
 	type env struct {
-		spec    rhtasv1alpha1.RekorSpec
+		spec    rhtasv1.RekorSpec
 		objects []client.Object
-		status  rhtasv1alpha1.RekorStatus
+		status  rhtasv1.RekorStatus
 	}
 	type want struct {
 		result *action.Result
@@ -111,14 +111,14 @@ func TestShardingConfig_Handle(t *testing.T) {
 		{
 			name: "create empty sharding config",
 			env: env{
-				spec: rhtasv1alpha1.RekorSpec{
-					Sharding: make([]rhtasv1alpha1.RekorLogRange, 0),
+				spec: rhtasv1.RekorSpec{
+					Sharding: make([]rhtasv1.RekorLogRange, 0),
 				},
 			},
 			want: want{
-				result: testAction.StatusUpdate(),
+				result: testAction.Return(),
 				verify: func(g Gomega, c client.WithWatch, events <-chan watch.Event) {
-					r := rhtasv1alpha1.Rekor{}
+					r := rhtasv1.Rekor{}
 					g.Expect(c.Get(context.TODO(), rekorNN, &r)).To(Succeed())
 					g.Expect(r.Status.ServerConfigRef).ShouldNot(BeNil())
 					g.Expect(r.Status.ServerConfigRef.Name).Should(ContainSubstring(cmName))
@@ -139,8 +139,8 @@ func TestShardingConfig_Handle(t *testing.T) {
 		{
 			name: "create sharding config with 2 shards",
 			env: env{
-				spec: rhtasv1alpha1.RekorSpec{
-					Sharding: []rhtasv1alpha1.RekorLogRange{
+				spec: rhtasv1.RekorSpec{
+					Sharding: []rhtasv1.RekorLogRange{
 						{
 							TreeID:           222222,
 							TreeLength:       10,
@@ -155,9 +155,9 @@ func TestShardingConfig_Handle(t *testing.T) {
 				},
 			},
 			want: want{
-				result: testAction.StatusUpdate(),
+				result: testAction.Return(),
 				verify: func(g Gomega, c client.WithWatch, events <-chan watch.Event) {
-					r := rhtasv1alpha1.Rekor{}
+					r := rhtasv1.Rekor{}
 					g.Expect(c.Get(context.TODO(), rekorNN, &r)).To(Succeed())
 					g.Expect(r.Status.ServerConfigRef).ShouldNot(BeNil())
 					g.Expect(r.Status.ServerConfigRef.Name).Should(ContainSubstring(cmName))
@@ -166,7 +166,7 @@ func TestShardingConfig_Handle(t *testing.T) {
 					g.Expect(c.Get(context.TODO(), types.NamespacedName{Name: r.Status.ServerConfigRef.Name, Namespace: rekorNN.Namespace}, &cm)).To(Succeed())
 					g.Expect(cm.Data).Should(HaveKey(shardingConfigName))
 
-					rlr := make([]rhtasv1alpha1.RekorLogRange, 0)
+					rlr := make([]rhtasv1.RekorLogRange, 0)
 					g.Expect(yaml.Unmarshal([]byte(cm.Data[shardingConfigName]), &rlr)).To(Succeed())
 					g.Expect(rlr).Should(Equal(r.Spec.Sharding))
 
@@ -182,8 +182,8 @@ func TestShardingConfig_Handle(t *testing.T) {
 		{
 			name: "update sharding config",
 			env: env{
-				spec: rhtasv1alpha1.RekorSpec{
-					Sharding: []rhtasv1alpha1.RekorLogRange{
+				spec: rhtasv1.RekorSpec{
+					Sharding: []rhtasv1.RekorLogRange{
 						{
 							TreeID:     111111,
 							TreeLength: 10,
@@ -194,26 +194,28 @@ func TestShardingConfig_Handle(t *testing.T) {
 						},
 					},
 				},
-				status: rhtasv1alpha1.RekorStatus{
-					ServerConfigRef: &rhtasv1alpha1.LocalObjectReference{Name: cmName + "old"},
+				status: rhtasv1.RekorStatus{
+					ServerConfigRef: &rhtasv1.LocalObjectReference{Name: cmName + "old"},
 				},
 				objects: []client.Object{
-					kubernetes.CreateConfigmap(
-						"default",
-						cmName+"old",
-						map[string]string{},
-						errors.IgnoreError(createShardingConfigData([]rhtasv1alpha1.RekorLogRange{
+					&v1.ConfigMap{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+							Name:      cmName + "old",
+						},
+						Data: errors.IgnoreError(createShardingConfigData([]rhtasv1.RekorLogRange{
 							{
 								TreeID:     111111,
 								TreeLength: 10,
 							},
-						}))),
+						})),
+					},
 				},
 			},
 			want: want{
-				result: testAction.StatusUpdate(),
+				result: testAction.Return(),
 				verify: func(g Gomega, c client.WithWatch, events <-chan watch.Event) {
-					r := rhtasv1alpha1.Rekor{}
+					r := rhtasv1.Rekor{}
 					g.Expect(c.Get(context.TODO(), rekorNN, &r)).To(Succeed())
 					g.Expect(r.Status.ServerConfigRef).ShouldNot(BeNil())
 					g.Expect(r.Status.ServerConfigRef.Name).Should(ContainSubstring(cmName))
@@ -223,7 +225,7 @@ func TestShardingConfig_Handle(t *testing.T) {
 					g.Expect(c.Get(context.TODO(), types.NamespacedName{Name: r.Status.ServerConfigRef.Name, Namespace: rekorNN.Namespace}, &cm)).To(Succeed())
 					g.Expect(cm.Data).Should(HaveKey(shardingConfigName))
 
-					rlr := make([]rhtasv1alpha1.RekorLogRange, 0)
+					rlr := make([]rhtasv1.RekorLogRange, 0)
 					g.Expect(yaml.Unmarshal([]byte(cm.Data[shardingConfigName]), &rlr)).To(Succeed())
 					g.Expect(rlr).Should(Equal(r.Spec.Sharding))
 
@@ -244,29 +246,31 @@ func TestShardingConfig_Handle(t *testing.T) {
 		{
 			name: "update empty sharding config",
 			env: env{
-				spec: rhtasv1alpha1.RekorSpec{
-					Sharding: []rhtasv1alpha1.RekorLogRange{
+				spec: rhtasv1.RekorSpec{
+					Sharding: []rhtasv1.RekorLogRange{
 						{
 							TreeID:     123456,
 							TreeLength: 10,
 						},
 					},
 				},
-				status: rhtasv1alpha1.RekorStatus{
-					ServerConfigRef: &rhtasv1alpha1.LocalObjectReference{Name: cmName + "old"},
+				status: rhtasv1.RekorStatus{
+					ServerConfigRef: &rhtasv1.LocalObjectReference{Name: cmName + "old"},
 				},
 				objects: []client.Object{
-					kubernetes.CreateConfigmap(
-						"default",
-						cmName+"old",
-						map[string]string{},
-						errors.IgnoreError(createShardingConfigData([]rhtasv1alpha1.RekorLogRange{}))),
+					&v1.ConfigMap{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+							Name:      cmName + "old",
+						},
+						Data: errors.IgnoreError(createShardingConfigData([]rhtasv1.RekorLogRange{})),
+					},
 				},
 			},
 			want: want{
-				result: testAction.StatusUpdate(),
+				result: testAction.Return(),
 				verify: func(g Gomega, c client.WithWatch, events <-chan watch.Event) {
-					r := rhtasv1alpha1.Rekor{}
+					r := rhtasv1.Rekor{}
 					g.Expect(c.Get(context.TODO(), rekorNN, &r)).To(Succeed())
 					g.Expect(r.Status.ServerConfigRef).ShouldNot(BeNil())
 					g.Expect(r.Status.ServerConfigRef.Name).Should(ContainSubstring(cmName))
@@ -276,7 +280,7 @@ func TestShardingConfig_Handle(t *testing.T) {
 					g.Expect(c.Get(context.TODO(), types.NamespacedName{Name: r.Status.ServerConfigRef.Name, Namespace: rekorNN.Namespace}, &cm)).To(Succeed())
 					g.Expect(cm.Data).Should(HaveKey(shardingConfigName))
 
-					rlr := make([]rhtasv1alpha1.RekorLogRange, 0)
+					rlr := make([]rhtasv1.RekorLogRange, 0)
 					g.Expect(yaml.Unmarshal([]byte(cm.Data[shardingConfigName]), &rlr)).To(Succeed())
 					g.Expect(rlr).Should(Equal(r.Spec.Sharding))
 
@@ -297,22 +301,24 @@ func TestShardingConfig_Handle(t *testing.T) {
 		{
 			name: "spec.sharding == sharding ConfigMap (empty)",
 			env: env{
-				spec: rhtasv1alpha1.RekorSpec{},
-				status: rhtasv1alpha1.RekorStatus{
-					ServerConfigRef: &rhtasv1alpha1.LocalObjectReference{Name: cmName + "old"},
+				spec: rhtasv1.RekorSpec{},
+				status: rhtasv1.RekorStatus{
+					ServerConfigRef: &rhtasv1.LocalObjectReference{Name: cmName + "old"},
 				},
 				objects: []client.Object{
-					kubernetes.CreateConfigmap(
-						"default",
-						cmName+"old",
-						map[string]string{},
-						errors.IgnoreError(createShardingConfigData([]rhtasv1alpha1.RekorLogRange{}))),
+					&v1.ConfigMap{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+							Name:      cmName + "old",
+						},
+						Data: errors.IgnoreError(createShardingConfigData([]rhtasv1.RekorLogRange{})),
+					},
 				},
 			},
 			want: want{
 				result: testAction.Continue(),
 				verify: func(g Gomega, c client.WithWatch, events <-chan watch.Event) {
-					r := rhtasv1alpha1.Rekor{}
+					r := rhtasv1.Rekor{}
 					g.Expect(c.Get(context.TODO(), rekorNN, &r)).To(Succeed())
 					g.Expect(r.Status.ServerConfigRef).ShouldNot(BeNil())
 					g.Expect(r.Status.ServerConfigRef.Name).Should(Equal(cmName + "old"))
@@ -321,7 +327,7 @@ func TestShardingConfig_Handle(t *testing.T) {
 					g.Expect(c.Get(context.TODO(), types.NamespacedName{Name: r.Status.ServerConfigRef.Name, Namespace: rekorNN.Namespace}, &cm)).To(Succeed())
 					g.Expect(cm.Data).Should(HaveKeyWithValue(shardingConfigName, ""))
 
-					rlr := make([]rhtasv1alpha1.RekorLogRange, 0)
+					rlr := make([]rhtasv1.RekorLogRange, 0)
 					g.Expect(yaml.Unmarshal([]byte(cm.Data[shardingConfigName]), &rlr)).To(Succeed())
 					g.Expect(rlr).Should(BeEmpty())
 				},
@@ -330,34 +336,36 @@ func TestShardingConfig_Handle(t *testing.T) {
 		{
 			name: "spec.sharding == sharding ConfigMap",
 			env: env{
-				spec: rhtasv1alpha1.RekorSpec{
-					Sharding: []rhtasv1alpha1.RekorLogRange{
+				spec: rhtasv1.RekorSpec{
+					Sharding: []rhtasv1.RekorLogRange{
 						{
 							TreeID:     111111,
 							TreeLength: 10,
 						},
 					},
 				},
-				status: rhtasv1alpha1.RekorStatus{
-					ServerConfigRef: &rhtasv1alpha1.LocalObjectReference{Name: cmName + "old"},
+				status: rhtasv1.RekorStatus{
+					ServerConfigRef: &rhtasv1.LocalObjectReference{Name: cmName + "old"},
 				},
 				objects: []client.Object{
-					kubernetes.CreateConfigmap(
-						"default",
-						cmName+"old",
-						map[string]string{},
-						errors.IgnoreError(createShardingConfigData([]rhtasv1alpha1.RekorLogRange{
+					&v1.ConfigMap{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+							Name:      cmName + "old",
+						},
+						Data: errors.IgnoreError(createShardingConfigData([]rhtasv1.RekorLogRange{
 							{
 								TreeID:     111111,
 								TreeLength: 10,
 							},
-						}))),
+						})),
+					},
 				},
 			},
 			want: want{
 				result: testAction.Continue(),
 				verify: func(g Gomega, c client.WithWatch, events <-chan watch.Event) {
-					r := rhtasv1alpha1.Rekor{}
+					r := rhtasv1.Rekor{}
 					g.Expect(c.Get(context.TODO(), rekorNN, &r)).To(Succeed())
 					g.Expect(r.Status.ServerConfigRef).ShouldNot(BeNil())
 					g.Expect(r.Status.ServerConfigRef.Name).Should(Equal(cmName + "old"))
@@ -366,7 +374,7 @@ func TestShardingConfig_Handle(t *testing.T) {
 					g.Expect(c.Get(context.TODO(), types.NamespacedName{Name: r.Status.ServerConfigRef.Name, Namespace: rekorNN.Namespace}, &cm)).To(Succeed())
 					g.Expect(cm.Data).Should(HaveKey(shardingConfigName))
 
-					rlr := make([]rhtasv1alpha1.RekorLogRange, 0)
+					rlr := make([]rhtasv1.RekorLogRange, 0)
 					g.Expect(yaml.Unmarshal([]byte(cm.Data[shardingConfigName]), &rlr)).To(Succeed())
 					g.Expect(rlr).Should(Equal(r.Spec.Sharding))
 
@@ -377,15 +385,15 @@ func TestShardingConfig_Handle(t *testing.T) {
 		{
 			name: "status.serverConfigRef not found",
 			env: env{
-				spec: rhtasv1alpha1.RekorSpec{},
-				status: rhtasv1alpha1.RekorStatus{
-					ServerConfigRef: &rhtasv1alpha1.LocalObjectReference{Name: cmName + "deleted"},
+				spec: rhtasv1.RekorSpec{},
+				status: rhtasv1.RekorStatus{
+					ServerConfigRef: &rhtasv1.LocalObjectReference{Name: cmName + "deleted"},
 				},
 			},
 			want: want{
-				result: testAction.StatusUpdate(),
+				result: testAction.Return(),
 				verify: func(g Gomega, c client.WithWatch, events <-chan watch.Event) {
-					r := rhtasv1alpha1.Rekor{}
+					r := rhtasv1.Rekor{}
 					g.Expect(c.Get(context.TODO(), rekorNN, &r)).To(Succeed())
 					g.Expect(r.Status.ServerConfigRef).ShouldNot(BeNil())
 					g.Expect(r.Status.ServerConfigRef.Name).ShouldNot(Equal(cmName + "deleted"))
@@ -407,20 +415,23 @@ func TestShardingConfig_Handle(t *testing.T) {
 		{
 			name: "delete unassigned sharding configmap",
 			env: env{
-				spec:   rhtasv1alpha1.RekorSpec{},
-				status: rhtasv1alpha1.RekorStatus{},
+				spec:   rhtasv1.RekorSpec{},
+				status: rhtasv1.RekorStatus{},
 				objects: []client.Object{
-					kubernetes.CreateConfigmap(
-						"default",
-						cmName+"old",
-						shardingConfigLabels,
-						map[string]string{shardingConfigName: ""}),
+					&v1.ConfigMap{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+							Name:      cmName + "old",
+							Labels:    shardingConfigLabels,
+						},
+						Data: map[string]string{shardingConfigName: ""},
+					},
 				},
 			},
 			want: want{
-				result: testAction.StatusUpdate(),
+				result: testAction.Return(),
 				verify: func(g Gomega, c client.WithWatch, events <-chan watch.Event) {
-					r := rhtasv1alpha1.Rekor{}
+					r := rhtasv1.Rekor{}
 					g.Expect(c.Get(context.TODO(), rekorNN, &r)).To(Succeed())
 					g.Expect(r.Status.ServerConfigRef).ShouldNot(BeNil())
 					g.Expect(r.Status.ServerConfigRef.Name).ShouldNot(Equal(cmName + "old"))
@@ -442,25 +453,31 @@ func TestShardingConfig_Handle(t *testing.T) {
 		{
 			name: "remove invalid config and keep other CM",
 			env: env{
-				spec:   rhtasv1alpha1.RekorSpec{},
-				status: rhtasv1alpha1.RekorStatus{},
+				spec:   rhtasv1.RekorSpec{},
+				status: rhtasv1.RekorStatus{},
 				objects: []client.Object{
-					kubernetes.CreateConfigmap(
-						"default",
-						"keep",
-						labels.For(actions.ServerComponentName, actions.ServerDeploymentName, "rekor"),
-						map[string]string{}),
-					kubernetes.CreateConfigmap(
-						"default",
-						cmName+"old",
-						shardingConfigLabels,
-						map[string]string{shardingConfigName: "fake"}),
+					&v1.ConfigMap{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+							Name:      "keep",
+							Labels:    labels.For(actions.ServerComponentName, actions.ServerDeploymentName, "rekor"),
+						},
+						Data: map[string]string{},
+					},
+					&v1.ConfigMap{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+							Name:      cmName + "old",
+							Labels:    shardingConfigLabels,
+						},
+						Data: map[string]string{shardingConfigName: "fake"},
+					},
 				},
 			},
 			want: want{
-				result: testAction.StatusUpdate(),
+				result: testAction.Return(),
 				verify: func(g Gomega, c client.WithWatch, events <-chan watch.Event) {
-					r := rhtasv1alpha1.Rekor{}
+					r := rhtasv1.Rekor{}
 					g.Expect(c.Get(context.TODO(), rekorNN, &r)).To(Succeed())
 					g.Expect(r.Status.ServerConfigRef).ShouldNot(BeNil())
 					g.Expect(r.Status.ServerConfigRef.Name).Should(Not(Equal(cmName + "old")))
@@ -487,7 +504,7 @@ func TestShardingConfig_Handle(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			g := NewWithT(t)
 			ctx := context.TODO()
-			instance := &rhtasv1alpha1.Rekor{
+			instance := &rhtasv1.Rekor{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "rekor",
 					Namespace: "default",
@@ -497,7 +514,7 @@ func TestShardingConfig_Handle(t *testing.T) {
 			}
 
 			meta.SetStatusCondition(&instance.Status.Conditions,
-				metav1.Condition{Type: constants.Ready, Reason: constants.Creating},
+				metav1.Condition{Type: constants.ReadyCondition, Reason: state.Creating.String()},
 			)
 
 			c := testAction.FakeClientBuilder().

@@ -3,21 +3,20 @@ package actions
 import (
 	"context"
 	"errors"
-	"fmt"
+	"time"
 
-	"github.com/securesign/operator/internal/controller/common/action"
-	"github.com/securesign/operator/internal/controller/constants"
-	"github.com/securesign/operator/internal/controller/labels"
-	v12 "k8s.io/api/networking/v1"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/constants"
+	tufConstants "github.com/securesign/operator/internal/controller/tuf/constants"
+	"github.com/securesign/operator/internal/labels"
+	"github.com/securesign/operator/internal/state"
+	commonUtils "github.com/securesign/operator/internal/utils/kubernetes"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	commonUtils "github.com/securesign/operator/internal/controller/common/utils/kubernetes"
 )
 
-func NewInitializeAction() action.Action[*rhtasv1alpha1.Tuf] {
+func NewInitializeAction() action.Action[*rhtasv1.Tuf] {
 	return &initializeAction{}
 }
 
@@ -29,52 +28,36 @@ func (i initializeAction) Name() string {
 	return "initialize"
 }
 
-func (i initializeAction) CanHandle(_ context.Context, tuf *rhtasv1alpha1.Tuf) bool {
-	c := meta.FindStatusCondition(tuf.Status.Conditions, constants.Ready)
-	return c.Reason == constants.Initialize
+func (i initializeAction) CanHandle(_ context.Context, tuf *rhtasv1.Tuf) bool {
+	return state.FromInstance(tuf, constants.ReadyCondition) == state.Initialize
 }
 
-func (i initializeAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Tuf) *action.Result {
+func (i initializeAction) Handle(ctx context.Context, instance *rhtasv1.Tuf) *action.Result {
 	var (
 		ok  bool
 		err error
 	)
-	labels := labels.ForComponent(ComponentName, instance.Name)
+	labels := labels.ForComponent(tufConstants.ComponentName, instance.Name)
 	ok, err = commonUtils.DeploymentIsRunning(ctx, i.Client, instance.Namespace, labels)
 	switch {
 	case errors.Is(err, commonUtils.ErrDeploymentNotReady):
-		i.Logger.Error(err, "deployment is not ready")
+		i.Logger.Info("deployment is not ready", "error", err.Error())
 	case err != nil:
-		return i.Failed(err)
+		return i.Error(ctx, err, instance)
 	}
 	if !ok {
 		i.Logger.Info("Waiting for deployment")
 		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:    constants.Ready,
+			Type:    constants.ReadyCondition,
 			Status:  metav1.ConditionFalse,
-			Reason:  constants.Initialize,
+			Reason:  state.Initialize.String(),
 			Message: "Waiting for deployment to be ready",
 		})
-		return i.StatusUpdate(ctx, instance)
+		if _, err := i.PersistStatus(ctx, instance); err != nil {
+			return i.Error(ctx, err, instance)
+		}
+		return i.RequeueAfter(5 * time.Second)
 	}
 
-	if instance.Spec.ExternalAccess.Enabled {
-		protocol := "http://"
-		ingress := &v12.Ingress{}
-		err = i.Client.Get(ctx, types.NamespacedName{Name: ComponentName, Namespace: instance.Namespace}, ingress)
-		if err != nil {
-			return i.Failed(err)
-		}
-		if len(ingress.Spec.TLS) > 0 {
-			protocol = "https://"
-		}
-		instance.Status.Url = protocol + ingress.Spec.Rules[0].Host
-	} else {
-		instance.Status.Url = fmt.Sprintf("http://%s.%s.svc", DeploymentName, instance.Namespace)
-	}
-
-	meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{Type: constants.Ready,
-		Status: metav1.ConditionTrue, Reason: constants.Ready})
-
-	return i.StatusUpdate(ctx, instance)
+	return i.Continue()
 }

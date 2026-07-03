@@ -5,15 +5,19 @@ import (
 	"testing"
 
 	. "github.com/onsi/gomega"
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/common/action"
-	"github.com/securesign/operator/internal/controller/constants"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/constants"
+	"github.com/securesign/operator/internal/labels"
+	"github.com/securesign/operator/internal/state"
 	common "github.com/securesign/operator/internal/testing/common/tsa"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apilabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -32,61 +36,71 @@ func Test_NTPName(t *testing.T) {
 }
 
 func Test_NTPCanHandle(t *testing.T) {
-	g := NewWithT(t)
 	tests := []struct {
 		name     string
-		testCase func(*rhtasv1alpha1.TimestampAuthority)
+		testCase func(*rhtasv1.TimestampAuthority)
 		expected bool
 	}{
 		{
 			name:     "Default condition",
-			testCase: func(instance *rhtasv1alpha1.TimestampAuthority) {},
+			testCase: func(instance *rhtasv1.TimestampAuthority) {},
 			expected: true,
 		},
 		{
 			name: "Creating condition",
-			testCase: func(instance *rhtasv1alpha1.TimestampAuthority) {
-				instance.Status.Conditions[0].Reason = constants.Creating
+			testCase: func(instance *rhtasv1.TimestampAuthority) {
+				instance.Status.Conditions[0].Reason = state.Creating.String()
 			},
 			expected: true,
 		},
 		{
 			name: "NTPMonitoring status is different to spec",
-			testCase: func(instance *rhtasv1alpha1.TimestampAuthority) {
-				instance.Status.NTPMonitoring = &rhtasv1alpha1.NTPMonitoring{
-					Enabled: true,
-					Config: &rhtasv1alpha1.NtpMonitoringConfig{
-						RequestAttempts: 1,
-						RequestTimeout:  5,
-						NumServers:      4,
-						ServerThreshold: 3,
-						MaxTimeDelta:    6,
-						Period:          60,
-						Servers:         []string{"time.apple.com", "time.google.com"},
-					},
+			testCase: func(instance *rhtasv1.TimestampAuthority) {
+				instance.Status.NtpConfigRef = &rhtasv1.LocalObjectReference{
+					Name: "different-config",
 				}
 			},
 			expected: true,
 		},
 		{
 			name: "Pending condition",
-			testCase: func(instance *rhtasv1alpha1.TimestampAuthority) {
-				instance.Status.Conditions[0].Reason = constants.Pending
+			testCase: func(instance *rhtasv1.TimestampAuthority) {
+				instance.Status.Conditions[0].Reason = state.Pending.String()
 			},
 			expected: false,
 		},
 		{
 			name: "NTPMonitoring is disabled",
-			testCase: func(instance *rhtasv1alpha1.TimestampAuthority) {
-				instance.Spec.NTPMonitoring.Enabled = false
+			testCase: func(instance *rhtasv1.TimestampAuthority) {
+				instance.Status.Conditions[0].Reason = state.Creating.String()
+				instance.Spec.NTPMonitoring.Enabled = ptr.To(false)
 				instance.Spec.NTPMonitoring.Config = nil
 			},
-			expected: false,
+			expected: true,
+		},
+		{
+			name: "config is nil",
+			testCase: func(instance *rhtasv1.TimestampAuthority) {
+				instance.Status.Conditions[0].Reason = state.Creating.String()
+				instance.Spec.NTPMonitoring.Enabled = ptr.To(true)
+				instance.Spec.NTPMonitoring.Config = nil
+			},
+			expected: true,
+		},
+		{
+			name: "config is nil and status same",
+			testCase: func(instance *rhtasv1.TimestampAuthority) {
+				instance.Status.Conditions[0].Reason = state.Creating.String()
+				instance.Spec.NTPMonitoring.Enabled = ptr.To(true)
+				instance.Spec.NTPMonitoring.Config = nil
+			},
+			expected: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
 			action := NewNtpMonitoringAction()
 			instance := common.GenerateTSAInstance()
 			tt.testCase(instance)
@@ -98,37 +112,39 @@ func Test_NTPCanHandle(t *testing.T) {
 func Test_NTPHandle(t *testing.T) {
 	tests := []struct {
 		name     string
-		setup    func(instance *rhtasv1alpha1.TimestampAuthority) (client.WithWatch, action.Action[*rhtasv1alpha1.TimestampAuthority])
-		testCase func(Gomega, action.Action[*rhtasv1alpha1.TimestampAuthority], client.WithWatch, *rhtasv1alpha1.TimestampAuthority) bool
+		setup    func(instance *rhtasv1.TimestampAuthority) (client.WithWatch, action.Action[*rhtasv1.TimestampAuthority])
+		testCase func(Gomega, action.Action[*rhtasv1.TimestampAuthority], client.WithWatch, *rhtasv1.TimestampAuthority) bool
 	}{
 		{
 			name: "Succeeds with config specified",
-			setup: func(instance *rhtasv1alpha1.TimestampAuthority) (client.WithWatch, action.Action[*rhtasv1alpha1.TimestampAuthority]) {
-				instance.Status.Conditions[0].Reason = constants.Creating
+			setup: func(instance *rhtasv1.TimestampAuthority) (client.WithWatch, action.Action[*rhtasv1.TimestampAuthority]) {
+				instance.Status.Conditions[0].Reason = state.Creating.String()
 				return common.TsaTestSetup(instance, t, nil, NewNtpMonitoringAction(), []client.Object{}...)
 			},
-			testCase: func(g Gomega, _ action.Action[*rhtasv1alpha1.TimestampAuthority], client client.WithWatch, instance *rhtasv1alpha1.TimestampAuthority) bool {
-				g.Expect(instance.Status.NTPMonitoring).NotTo(BeNil(), "Status NTP Monitoring Config should not be nil")
+			testCase: func(g Gomega, _ action.Action[*rhtasv1.TimestampAuthority], client client.WithWatch, instance *rhtasv1.TimestampAuthority) bool {
+				g.Expect(instance.Status.NtpConfigRef).NotTo(BeNil(), "Status NtpConfigRef should not be nil")
 
 				cm := &corev1.ConfigMap{}
-				err := client.Get(context.TODO(), types.NamespacedName{Name: instance.Status.NTPMonitoring.Config.NtpConfigRef.Name, Namespace: instance.GetNamespace()}, cm)
+				err := client.Get(context.TODO(), types.NamespacedName{Name: instance.Status.NtpConfigRef.Name, Namespace: instance.GetNamespace()}, cm)
 				g.Expect(err).NotTo(HaveOccurred(), "Unable to find config map")
 
-				g.Expect(instance.Status.NTPMonitoring.Config.NtpConfigRef.Name).To(Equal(cm.Name), "Config Map name mismatch")
+				g.Expect(instance.Status.NtpConfigRef.Name).To(Equal(cm.Name), "Config Map name mismatch")
 
-				g.Expect(meta.FindStatusCondition(instance.Status.Conditions, constants.Ready).Message).To(Equal("NTP monitoring configured"))
+				cond := meta.FindStatusCondition(instance.Status.Conditions, constants.ReadyCondition)
+				g.Expect(cond).ToNot(BeNil())
+				g.Expect(cond.Message).To(Equal("NTP monitoring configured"))
 
 				return true
 			},
 		},
 		{
 			name: "Succeeds with config provided",
-			setup: func(instance *rhtasv1alpha1.TimestampAuthority) (client.WithWatch, action.Action[*rhtasv1alpha1.TimestampAuthority]) {
-				instance.Status.Conditions[0].Reason = constants.Creating
-				instance.Spec.NTPMonitoring = rhtasv1alpha1.NTPMonitoring{
-					Enabled: true,
-					Config: &rhtasv1alpha1.NtpMonitoringConfig{
-						NtpConfigRef: &rhtasv1alpha1.LocalObjectReference{
+			setup: func(instance *rhtasv1.TimestampAuthority) (client.WithWatch, action.Action[*rhtasv1.TimestampAuthority]) {
+				instance.Status.Conditions[0].Reason = state.Creating.String()
+				instance.Spec.NTPMonitoring = rhtasv1.NTPMonitoring{
+					Enabled: ptr.To(true),
+					Config: &rhtasv1.NtpMonitoringConfig{
+						NtpConfigRef: &rhtasv1.LocalObjectReference{
 							Name: "ntp-config",
 						},
 					},
@@ -145,79 +161,111 @@ func Test_NTPHandle(t *testing.T) {
 				obj := []client.Object{config}
 				return common.TsaTestSetup(instance, t, nil, NewNtpMonitoringAction(), obj...)
 			},
-			testCase: func(g Gomega, _ action.Action[*rhtasv1alpha1.TimestampAuthority], client client.WithWatch, instance *rhtasv1alpha1.TimestampAuthority) bool {
-				g.Expect(instance.Status.NTPMonitoring).NotTo(BeNil(), "Status NTP Monitoring Config should not be nil")
+			testCase: func(g Gomega, _ action.Action[*rhtasv1.TimestampAuthority], client client.WithWatch, instance *rhtasv1.TimestampAuthority) bool {
+				g.Expect(instance.Status.NtpConfigRef).NotTo(BeNil(), "Status NtpConfigRef should not be nil")
 
-				g.Expect(instance.Status.NTPMonitoring.Config.NtpConfigRef.Name).To(Equal(instance.Spec.NTPMonitoring.Config.NtpConfigRef.Name), "Config Map mismatch")
+				g.Expect(instance.Status.NtpConfigRef.Name).To(Equal(instance.Spec.NTPMonitoring.Config.NtpConfigRef.Name), "Config Map mismatch")
 
 				cm := &corev1.ConfigMap{}
-				err := client.Get(context.TODO(), types.NamespacedName{Name: instance.Status.NTPMonitoring.Config.NtpConfigRef.Name, Namespace: instance.GetNamespace()}, cm)
+				err := client.Get(context.TODO(), types.NamespacedName{Name: instance.Status.NtpConfigRef.Name, Namespace: instance.GetNamespace()}, cm)
 				g.Expect(err).NotTo(HaveOccurred(), "Unable to find config map")
 
-				g.Expect(meta.FindStatusCondition(instance.Status.Conditions, constants.Ready).Message).To(Equal("NTP monitoring configured"))
+				cond := meta.FindStatusCondition(instance.Status.Conditions, constants.ReadyCondition)
+				g.Expect(cond).ToNot(BeNil())
+				g.Expect(cond.Message).To(Equal("NTP monitoring configured"))
 
 				return true
 			},
 		},
 		{
 			name: "should update configuration",
-			setup: func(instance *rhtasv1alpha1.TimestampAuthority) (client.WithWatch, action.Action[*rhtasv1alpha1.TimestampAuthority]) {
-				instance.Status.Conditions[0].Reason = constants.Creating
+			setup: func(instance *rhtasv1.TimestampAuthority) (client.WithWatch, action.Action[*rhtasv1.TimestampAuthority]) {
+				instance.Status.Conditions[0].Reason = state.Creating.String()
 				return common.TsaTestSetup(instance, t, nil, NewNtpMonitoringAction(), []client.Object{}...)
 			},
-			testCase: func(g Gomega, a action.Action[*rhtasv1alpha1.TimestampAuthority], client client.WithWatch, instance *rhtasv1alpha1.TimestampAuthority) bool {
-				g.Expect(instance.Status.NTPMonitoring).NotTo(BeNil(), "Status NTP Monitoring Config should not be nil")
+			testCase: func(g Gomega, a action.Action[*rhtasv1.TimestampAuthority], cli client.WithWatch, instance *rhtasv1.TimestampAuthority) bool {
+				g.Expect(instance.Status.NtpConfigRef).NotTo(BeNil(), "Status NtpConfigRef should not be nil")
 
 				cm := &corev1.ConfigMap{}
-				err := client.Get(context.TODO(), types.NamespacedName{Name: instance.Status.NTPMonitoring.Config.NtpConfigRef.Name, Namespace: instance.GetNamespace()}, cm)
+				err := cli.Get(context.TODO(), types.NamespacedName{Name: instance.Status.NtpConfigRef.Name, Namespace: instance.GetNamespace()}, cm)
 				g.Expect(err).NotTo(HaveOccurred(), "Unable to find config map")
+				g.Expect(instance.Status.NtpConfigRef.Name).To(Equal(cm.Name), "Config Map name mismatch")
 
-				g.Expect(instance.Status.NTPMonitoring.Config.NtpConfigRef.Name).To(Equal(cm.Name), "Config Map name mismatch")
+				g.Eventually(func(g Gomega) error {
+					g.Expect(cli.Get(context.TODO(), client.ObjectKeyFromObject(instance), instance)).To(Succeed())
+					instance.Spec.NTPMonitoring.Config.NumServers = 2
+					return cli.Update(context.TODO(), instance)
+				}).Should(Succeed())
 
-				instance.Spec.NTPMonitoring.Config.NumServers = 2
-				err = client.Update(context.TODO(), instance)
 				g.Expect(err).NotTo(HaveOccurred(), "Error updating instance")
 
 				_ = a.Handle(context.TODO(), instance)
 
-				err = client.Get(context.TODO(), types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, instance)
+				err = cli.Get(context.TODO(), types.NamespacedName{Name: instance.Name, Namespace: instance.Namespace}, instance)
 				g.Expect(err).NotTo(HaveOccurred(), "Error re-fetching instance")
 
 				g.Expect(instance.Spec.NTPMonitoring.Config.NumServers).To(Equal(2), "NumServers mismatch")
 
-				g.Expect(meta.FindStatusCondition(instance.Status.Conditions, constants.Ready).Message).To(Equal("NTP monitoring configured"))
+				cond := meta.FindStatusCondition(instance.Status.Conditions, constants.ReadyCondition)
+				g.Expect(cond).ToNot(BeNil())
+				g.Expect(cond.Message).To(Equal("NTP monitoring configured"))
 
 				return true
 			},
 		},
 		{
 			name: "should delete old config",
-			setup: func(instance *rhtasv1alpha1.TimestampAuthority) (client.WithWatch, action.Action[*rhtasv1alpha1.TimestampAuthority]) {
-				instance.Status.Conditions[0].Reason = constants.Creating
+			setup: func(instance *rhtasv1.TimestampAuthority) (client.WithWatch, action.Action[*rhtasv1.TimestampAuthority]) {
+				instance.Status.Conditions[0].Reason = state.Creating.String()
 				return common.TsaTestSetup(instance, t, nil, NewNtpMonitoringAction(), []client.Object{}...)
 			},
-			testCase: func(g Gomega, a action.Action[*rhtasv1alpha1.TimestampAuthority], client client.WithWatch, instance *rhtasv1alpha1.TimestampAuthority) bool {
-				g.Expect(instance.Status.NTPMonitoring).NotTo(BeNil(), "Status NTP Monitoring Config should not be nil")
+			testCase: func(g Gomega, a action.Action[*rhtasv1.TimestampAuthority], cli client.WithWatch, instance *rhtasv1.TimestampAuthority) bool {
+				g.Expect(instance.Status.NtpConfigRef).NotTo(BeNil(), "Status NtpConfigRef should not be nil")
 
 				cm := &corev1.ConfigMap{}
-				err := client.Get(context.TODO(), types.NamespacedName{Name: instance.Status.NTPMonitoring.Config.NtpConfigRef.Name, Namespace: instance.GetNamespace()}, cm)
+				err := cli.Get(context.TODO(), types.NamespacedName{Name: instance.Status.NtpConfigRef.Name, Namespace: instance.GetNamespace()}, cm)
 				g.Expect(err).NotTo(HaveOccurred(), "Unable to find config map")
 
-				oldConfigMapName := instance.Status.NTPMonitoring.Config.NtpConfigRef.Name
+				g.Eventually(func(g Gomega) error {
+					g.Expect(cli.Get(context.TODO(), client.ObjectKeyFromObject(instance), instance)).To(Succeed())
+					instance.Spec.NTPMonitoring.Config.NumServers = 2
+					return cli.Update(context.TODO(), instance)
+				}).Should(Succeed())
 
-				instance.Spec.NTPMonitoring.Config.NumServers = 2
-				err = client.Update(context.TODO(), instance)
-				g.Expect(err).NotTo(HaveOccurred(), "Error updating instance")
+				oldConfigMapName := instance.Status.NtpConfigRef.Name
 
 				_ = a.Handle(context.TODO(), instance)
 
-				newConfigMapName := instance.Status.NTPMonitoring.Config.NtpConfigRef.Name
+				newConfigMapName := instance.Status.NtpConfigRef.Name
 				g.Expect(newConfigMapName).NotTo(Equal(oldConfigMapName), "New ConfigMap should have a different name from the old ConfigMap")
 
-				err = client.Get(context.TODO(), types.NamespacedName{Name: oldConfigMapName, Namespace: instance.GetNamespace()}, &corev1.ConfigMap{})
+				err = cli.Get(context.TODO(), types.NamespacedName{Name: oldConfigMapName, Namespace: instance.GetNamespace()}, &corev1.ConfigMap{})
 				g.Expect(errors.IsNotFound(err)).To(BeTrue(), "Old ConfigMap should be deleted")
 
-				g.Expect(meta.FindStatusCondition(instance.Status.Conditions, constants.Ready).Message).To(Equal("NTP monitoring configured"))
+				cond := meta.FindStatusCondition(instance.Status.Conditions, constants.ReadyCondition)
+				g.Expect(cond).ToNot(BeNil())
+				g.Expect(cond.Message).To(Equal("NTP monitoring configured"))
+
+				return true
+			},
+		},
+		{
+			name: "config is nil",
+			setup: func(instance *rhtasv1.TimestampAuthority) (client.WithWatch, action.Action[*rhtasv1.TimestampAuthority]) {
+				instance.Status.Conditions[0].Reason = state.Creating.String()
+				instance.Spec.NTPMonitoring.Config = nil
+				return common.TsaTestSetup(instance, t, nil, NewNtpMonitoringAction(), []client.Object{}...)
+			},
+			testCase: func(g Gomega, a action.Action[*rhtasv1.TimestampAuthority], cli client.WithWatch, instance *rhtasv1.TimestampAuthority) bool {
+				g.Expect(instance.Status.NtpConfigRef).To(BeNil(), "Status NtpConfigRef should be nil when config is nil")
+
+				l := map[string]string{
+					labels.LabelResource: ntpConfigLabel,
+				}
+
+				list := &corev1.ConfigMapList{}
+				g.Expect(cli.List(context.TODO(), list, &client.ListOptions{LabelSelector: apilabels.SelectorFromSet(l)})).To(Succeed())
+				g.Expect(list.Items).To(BeEmpty(), "List should be empty")
 
 				return true
 			},

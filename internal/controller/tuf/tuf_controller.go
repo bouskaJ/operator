@@ -20,18 +20,22 @@ import (
 	"context"
 
 	olpredicate "github.com/operator-framework/operator-lib/predicate"
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/annotations"
-	"github.com/securesign/operator/internal/controller/common/action"
-	"github.com/securesign/operator/internal/controller/common/action/transitions"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/action/transitions"
+	"github.com/securesign/operator/internal/annotations"
+	"github.com/securesign/operator/internal/controller"
+	"github.com/securesign/operator/internal/controller/predicate"
 	"github.com/securesign/operator/internal/controller/tuf/actions"
+	"github.com/securesign/operator/internal/controller/tuf/constants"
 	v1 "k8s.io/api/apps/v1"
 	v12 "k8s.io/api/core/v1"
 	v13 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -39,11 +43,19 @@ import (
 
 const DebugLevel int = 1
 
-// TufReconciler reconciles a Tuf object
-type TufReconciler struct {
+// tufReconciler reconciles a Tuf object
+type tufReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	scheme   *runtime.Scheme
+	recorder events.EventRecorder
+}
+
+func NewReconciler(c client.Client, scheme *runtime.Scheme, recorder events.EventRecorder) controller.Controller {
+	return &tufReconciler{
+		Client:   c,
+		scheme:   scheme,
+		recorder: recorder,
+	}
 }
 
 //+kubebuilder:rbac:groups=rhtas.redhat.com,resources=tufs,verbs=get;list;watch;create;update;patch;delete
@@ -59,13 +71,13 @@ type TufReconciler struct {
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.14.1/pkg/reconcile
-func (r *TufReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *tufReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	rlog := log.FromContext(ctx).WithName("controller").WithName("tuf")
 
 	// Fetch the Tuf instance
-	instance := &rhtasv1alpha1.Tuf{}
+	instance := &rhtasv1.Tuf{}
 
-	if err := r.Client.Get(ctx, req.NamespacedName, instance); err != nil {
+	if err := r.Get(ctx, req.NamespacedName, instance); err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -82,34 +94,43 @@ func (r *TufReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 
 	target := instance.DeepCopy()
-	acs := []action.Action[*rhtasv1alpha1.Tuf]{
-		transitions.NewToPendingPhaseAction[*rhtasv1alpha1.Tuf](func(tuf *rhtasv1alpha1.Tuf) []string {
-			conditions := make([]string, len(tuf.Spec.Keys))
-			for i, k := range tuf.Spec.Keys {
-				conditions[i] = k.Name
-			}
-			conditions = append(conditions, actions.RepositoryCondition)
-			return conditions
-		}),
+	conditionSupplier := func(tuf *rhtasv1.Tuf) []string {
+		conditions := make([]string, 0, len(tuf.Spec.Keys)+1)
+		for _, k := range tuf.Spec.Keys {
+			conditions = append(conditions, k.Name)
+		}
+		conditions = append(conditions, constants.RepositoryCondition)
+		return conditions
+	}
+	acs := []action.Action[*rhtasv1.Tuf]{
+		transitions.NewToPendingPhaseAction[*rhtasv1.Tuf](),
+		transitions.NewEnsureConditionsAction[*rhtasv1.Tuf](conditionSupplier),
 
 		actions.NewResolveKeysAction(),
-		transitions.NewToCreatePhaseAction[*rhtasv1alpha1.Tuf](),
+		transitions.NewToCreatePhaseAction[*rhtasv1.Tuf](),
+		actions.NewRBACInitJobAction(),
 		actions.NewRBACAction(),
 		actions.NewCreatePvcAction(),
 		actions.NewInitJobAction(),
 		actions.NewDeployAction(),
 		actions.NewServiceAction(),
 		actions.NewIngressAction(),
+		actions.NewStatusUrlAction(),
 
-		transitions.NewToInitializePhaseAction[*rhtasv1alpha1.Tuf](),
+		transitions.NewToInitializePhaseAction[*rhtasv1.Tuf](),
 
 		actions.NewInitializeAction(),
+
+		// run after the initialize action to ensure the repository is running also in case of the failed migration (do not fail to soon)
+		actions.NewMigrationJobAction(),
+
+		transitions.NewToReadyPhaseAction[*rhtasv1.Tuf](),
 	}
 
 	for _, a := range acs {
 		a.InjectClient(r.Client)
 		a.InjectLogger(rlog.WithName(a.Name()))
-		a.InjectRecorder(r.Recorder)
+		a.InjectRecorder(r.recorder)
 
 		if a.CanHandle(ctx, target) {
 			rlog.V(2).Info("Executing " + a.Name())
@@ -123,20 +144,20 @@ func (r *TufReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *TufReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *tufReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	var (
 		err error
 	)
 
 	// Filter out with the pause annotation.
-	pause, err := olpredicate.NewPause(annotations.PausedReconciliation)
+	pause, err := olpredicate.NewPause[client.Object](annotations.PausedReconciliation)
 	if err != nil {
 		return err
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		WithEventFilter(pause).
-		For(&rhtasv1alpha1.Tuf{}).
+		For(&rhtasv1.Tuf{}, builder.WithPredicates(predicate.ConfigurationChangedOnFailurePredicate[*rhtasv1.Tuf]())).
 		Owns(&v1.Deployment{}).
 		Owns(&v12.Service{}).
 		Owns(&v13.Ingress{}).

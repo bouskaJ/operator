@@ -12,7 +12,13 @@ const (
 	LogSignerComponentName  = "trillian-logsigner"
 	LogSignerMonitoringName = "prometheus-k8s-logsigner"
 
-	RBACName = "trillian"
+	LogServerTLSSecret = "%s-trillian-logserver-tls"
+	LogSignerTLSSecret = "%s-trillian-logsigner-tls"
+	DatabaseTLSSecret  = "%s-trillian-db-tls"
+
+	RBACServerName = "trillian-logserver"
+	RBACSignerName = "trillian-logsigner"
+	RBACDbName     = "trillian-db"
 
 	DbCondition     = "DBAvailable"
 	ServerCondition = "LogServerAvailable"
@@ -22,4 +28,11 @@ const (
 	ServerPortName  = "grpc"
 	MetricsPort     = 8090
 	MetricsPortName = "metrics"
+
+	SecretRootPassword = "mysql-root-password"
+	SecretPassword     = "mysql-password"
+	SecretDatabaseName = "mysql-database"
+	SecretUser         = "mysql-user"
+	SecretPort         = "mysql-port"
+	SecretHost         = "mysql-host"
 )

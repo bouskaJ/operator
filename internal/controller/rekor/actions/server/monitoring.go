@@ -3,21 +3,23 @@ package server
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 
-	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/common/action"
-	"github.com/securesign/operator/internal/controller/common/utils/kubernetes"
-	"github.com/securesign/operator/internal/controller/constants"
-	"github.com/securesign/operator/internal/controller/labels"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/constants"
 	"github.com/securesign/operator/internal/controller/rekor/actions"
-	v1 "k8s.io/api/rbac/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
+	"github.com/securesign/operator/internal/labels"
+	"github.com/securesign/operator/internal/state"
+	"github.com/securesign/operator/internal/utils"
+	"github.com/securesign/operator/internal/utils/kubernetes"
+	"github.com/securesign/operator/internal/utils/kubernetes/ensure"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-func NewCreateMonitorAction() action.Action[*rhtasv1alpha1.Rekor] {
+func NewCreateMonitorAction() action.Action[*rhtasv1.Rekor] {
 	return &monitoringAction{}
 }
 
@@ -29,116 +31,31 @@ func (i monitoringAction) Name() string {
 	return "create monitoring"
 }
 
-func (i monitoringAction) CanHandle(_ context.Context, instance *rhtasv1alpha1.Rekor) bool {
-	c := meta.FindStatusCondition(instance.Status.Conditions, constants.Ready)
-	return (c.Reason == constants.Creating || c.Reason == constants.Ready) && instance.Spec.Monitoring.Enabled
+func (i monitoringAction) CanHandle(_ context.Context, instance *rhtasv1.Rekor) bool {
+	return utils.IsEnabled(instance.Spec.Monitoring.Enabled) && state.FromInstance(instance, constants.ReadyCondition) >= state.Creating
 }
 
-func (i monitoringAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Rekor) *action.Result {
+func (i monitoringAction) Handle(ctx context.Context, instance *rhtasv1.Rekor) *action.Result {
 	var (
 		err error
 	)
 
 	monitoringLabels := labels.For(actions.ServerComponentName, actions.MonitoringRoleName, instance.Name)
 
-	role := kubernetes.CreateRole(
-		instance.Namespace,
-		actions.MonitoringRoleName,
-		monitoringLabels,
-		[]v1.PolicyRule{
-			{
-				APIGroups: []string{""},
-				Resources: []string{"services", "endpoints", "pods"},
-				Verbs:     []string{"get", "list", "watch"},
-			},
-		},
-	)
-
-	if err = controllerutil.SetControllerReference(instance, role, i.Client.Scheme()); err != nil {
-		return i.Failed(fmt.Errorf("could not set controller reference for role: %w", err))
-	}
-
-	if _, err = i.Ensure(ctx, role); err != nil {
-		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
+	if _, err = kubernetes.CreateOrUpdate(ctx, i.Client, kubernetes.CreateServiceMonitor(instance.Namespace, actions.ServerDeploymentName),
+		ensure.ControllerReference[*unstructured.Unstructured](instance, i.Client),
+		ensure.Labels[*unstructured.Unstructured](slices.Collect(maps.Keys(monitoringLabels)), monitoringLabels),
+		kubernetes.EnsureServiceMonitorSpec(
+			labels.ForComponent(actions.ServerComponentName, instance.Name),
+			kubernetes.ServiceMonitorEndpoint(actions.MetricsPortName),
+		),
+	); err != nil {
+		return i.Error(ctx, fmt.Errorf("could not create serviceMonitor: %w", err), instance, metav1.Condition{
 			Type:    actions.ServerCondition,
 			Status:  metav1.ConditionFalse,
-			Reason:  constants.Failure,
+			Reason:  state.Failure.String(),
 			Message: err.Error(),
 		})
-		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:    constants.Ready,
-			Status:  metav1.ConditionFalse,
-			Reason:  constants.Failure,
-			Message: err.Error(),
-		})
-		return i.FailedWithStatusUpdate(ctx, fmt.Errorf("could not create monitoring role: %w", err), instance)
-	}
-
-	roleBinding := kubernetes.CreateRoleBinding(
-		instance.Namespace,
-		actions.MonitoringRoleName,
-		monitoringLabels,
-		v1.RoleRef{
-			APIGroup: v1.SchemeGroupVersion.Group,
-			Kind:     "Role",
-			Name:     actions.MonitoringRoleName,
-		},
-		[]v1.Subject{
-			{Kind: "ServiceAccount", Name: "prometheus-k8s", Namespace: "openshift-monitoring"},
-		},
-	)
-	if err = controllerutil.SetControllerReference(instance, roleBinding, i.Client.Scheme()); err != nil {
-		return i.Failed(fmt.Errorf("could not set controller reference for role: %w", err))
-	}
-
-	if _, err = i.Ensure(ctx, roleBinding); err != nil {
-		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:    actions.ServerCondition,
-			Status:  metav1.ConditionFalse,
-			Reason:  constants.Failure,
-			Message: err.Error(),
-		})
-		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:    constants.Ready,
-			Status:  metav1.ConditionFalse,
-			Reason:  constants.Failure,
-			Message: err.Error(),
-		})
-		return i.FailedWithStatusUpdate(ctx, fmt.Errorf("could not create monitoring RoleBinding: %w", err), instance)
-	}
-
-	serviceMonitor := kubernetes.CreateServiceMonitor(
-		instance.Namespace,
-		actions.ServerDeploymentName,
-		monitoringLabels,
-		[]monitoringv1.Endpoint{
-			{
-				Interval: monitoringv1.Duration("30s"),
-				Port:     actions.MetricsPortName,
-				Scheme:   "http",
-			},
-		},
-		labels.ForComponent(actions.ServerComponentName, instance.Name),
-	)
-
-	if err = controllerutil.SetControllerReference(instance, serviceMonitor, i.Client.Scheme()); err != nil {
-		return i.Failed(fmt.Errorf("could not set controller reference for serviceMonitor: %w", err))
-	}
-
-	if _, err = i.Ensure(ctx, serviceMonitor); err != nil {
-		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:    actions.ServerCondition,
-			Status:  metav1.ConditionFalse,
-			Reason:  constants.Failure,
-			Message: err.Error(),
-		})
-		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:    constants.Ready,
-			Status:  metav1.ConditionFalse,
-			Reason:  constants.Failure,
-			Message: err.Error(),
-		})
-		return i.FailedWithStatusUpdate(ctx, fmt.Errorf("could not create serviceMonitor: %w", err), instance)
 	}
 
 	// monitors & RBAC are not watched - do not need to re-enqueue

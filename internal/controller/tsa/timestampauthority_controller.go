@@ -19,19 +19,22 @@ package tsa
 import (
 	"context"
 
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/action/transitions"
+	"github.com/securesign/operator/internal/annotations"
+	"github.com/securesign/operator/internal/controller"
+	"github.com/securesign/operator/internal/controller/predicate"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	olpredicate "github.com/operator-framework/operator-lib/predicate"
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/annotations"
-	"github.com/securesign/operator/internal/controller/common/action"
-	"github.com/securesign/operator/internal/controller/common/action/transitions"
+	rhtasv1 "github.com/securesign/operator/api/v1"
 	"github.com/securesign/operator/internal/controller/tsa/actions"
 	v1 "k8s.io/api/apps/v1"
 	v12 "k8s.io/api/core/v1"
@@ -39,11 +42,19 @@ import (
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-// TimestampAuthorityReconciler reconciles a TimestampAuthority object
-type TimestampAuthorityReconciler struct {
+// timestampAuthorityReconciler reconciles a TimestampAuthority object
+type timestampAuthorityReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	scheme   *runtime.Scheme
+	recorder events.EventRecorder
+}
+
+func NewReconciler(c client.Client, scheme *runtime.Scheme, recorder events.EventRecorder) controller.Controller {
+	return &timestampAuthorityReconciler{
+		Client:   c,
+		scheme:   scheme,
+		recorder: recorder,
+	}
 }
 
 //+kubebuilder:rbac:groups=rhtas.redhat.com,resources=timestampauthorities,verbs=get;list;watch;create;update;patch;delete
@@ -59,12 +70,12 @@ type TimestampAuthorityReconciler struct {
 //
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.16.3/pkg/reconcile
-func (r *TimestampAuthorityReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	var instance rhtasv1alpha1.TimestampAuthority
+func (r *timestampAuthorityReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var instance rhtasv1.TimestampAuthority
 	log := ctrllog.FromContext(ctx)
 	log.V(1).Info("Reconciling Timestamp Authority", "request", req)
 
-	if err := r.Client.Get(ctx, req.NamespacedName, &instance); err != nil {
+	if err := r.Get(ctx, req.NamespacedName, &instance); err != nil {
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -81,28 +92,33 @@ func (r *TimestampAuthorityReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 
 	target := instance.DeepCopy()
-	actions := []action.Action[*rhtasv1alpha1.TimestampAuthority]{
-		transitions.NewToPendingPhaseAction[*rhtasv1alpha1.TimestampAuthority](func(ta *rhtasv1alpha1.TimestampAuthority) []string {
-			components := []string{actions.TSASignerCondition, actions.TSAServerCondition}
-			return components
-		}),
+	conditionSupplier := func(_ *rhtasv1.TimestampAuthority) []string {
+		return []string{actions.TSASignerCondition}
+	}
+	actions := []action.Action[*rhtasv1.TimestampAuthority]{
+		transitions.NewToPendingPhaseAction[*rhtasv1.TimestampAuthority](),
+		transitions.NewEnsureConditionsAction[*rhtasv1.TimestampAuthority](conditionSupplier),
 		actions.NewGenerateSignerAction(),
-		transitions.NewToCreatePhaseAction[*rhtasv1alpha1.TimestampAuthority](),
+		transitions.NewToCreatePhaseAction[*rhtasv1.TimestampAuthority](),
 		actions.NewRBACAction(),
 		actions.NewNtpMonitoringAction(),
 		actions.NewDeployAction(),
 		actions.NewServiceAction(),
 		actions.NewIngressAction(),
+		actions.NewStatusUrlAction(),
 		actions.NewMonitoringAction(),
 
-		transitions.NewToInitializePhaseAction[*rhtasv1alpha1.TimestampAuthority](),
+		transitions.NewToInitializePhaseAction[*rhtasv1.TimestampAuthority](),
+
 		actions.NewInitializeAction(),
+
+		transitions.NewToReadyPhaseAction[*rhtasv1.TimestampAuthority](),
 	}
 
 	for _, a := range actions {
 		a.InjectClient(r.Client)
 		a.InjectLogger(log.WithName(a.Name()))
-		a.InjectRecorder(r.Recorder)
+		a.InjectRecorder(r.recorder)
 
 		if a.CanHandle(ctx, target) {
 			log.V(2).Info("Executing " + a.Name())
@@ -116,16 +132,16 @@ func (r *TimestampAuthorityReconciler) Reconcile(ctx context.Context, req ctrl.R
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *TimestampAuthorityReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *timestampAuthorityReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Filter out with the pause annotation.
-	pause, err := olpredicate.NewPause(annotations.PausedReconciliation)
+	pause, err := olpredicate.NewPause[client.Object](annotations.PausedReconciliation)
 	if err != nil {
 		return err
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		WithEventFilter(pause).
-		For(&rhtasv1alpha1.TimestampAuthority{}).
+		For(&rhtasv1.TimestampAuthority{}, builder.WithPredicates(predicate.ConfigurationChangedOnFailurePredicate[*rhtasv1.TimestampAuthority]())).
 		Owns(&v1.Deployment{}).
 		Owns(&v12.Service{}).
 		Owns(&v13.Ingress{}).

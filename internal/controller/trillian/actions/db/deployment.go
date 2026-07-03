@@ -2,25 +2,40 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
+	"slices"
+	"strings"
 
-	"github.com/securesign/operator/internal/controller/common/utils"
-	v1 "k8s.io/api/core/v1"
-
-	"github.com/securesign/operator/internal/controller/common/action"
-	"github.com/securesign/operator/internal/controller/common/utils/kubernetes"
-	"github.com/securesign/operator/internal/controller/constants"
-	"github.com/securesign/operator/internal/controller/labels"
-	"github.com/securesign/operator/internal/controller/trillian/actions"
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/constants"
 	trillianUtils "github.com/securesign/operator/internal/controller/trillian/utils"
+	"github.com/securesign/operator/internal/images"
+	"github.com/securesign/operator/internal/labels"
+	"github.com/securesign/operator/internal/state"
+	"github.com/securesign/operator/internal/utils"
+	"github.com/securesign/operator/internal/utils/kubernetes"
+	"github.com/securesign/operator/internal/utils/kubernetes/ensure"
+	"github.com/securesign/operator/internal/utils/kubernetes/ensure/deployment"
+	"github.com/securesign/operator/internal/utils/tls"
+
+	"github.com/securesign/operator/internal/controller/trillian/actions"
+	v2 "k8s.io/api/apps/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
+	rhtasv1 "github.com/securesign/operator/api/v1"
 )
 
-func NewDeployAction() action.Action[*rhtasv1alpha1.Trillian] {
+const (
+	livenessCommand  = "mariadb-admin -u ${MYSQL_USER} -p${MYSQL_PASSWORD} ping"
+	readinessCommand = "mariadb -u ${MYSQL_USER} -p${MYSQL_PASSWORD} -e \"SELECT 1;\""
+)
+
+func NewDeployAction() action.Action[*rhtasv1.Trillian] {
 	return &deployAction{}
 }
 
@@ -32,91 +47,208 @@ func (i deployAction) Name() string {
 	return "deploy"
 }
 
-func (i deployAction) CanHandle(ctx context.Context, instance *rhtasv1alpha1.Trillian) bool {
-	c := meta.FindStatusCondition(instance.Status.Conditions, constants.Ready)
-	return (c.Reason == constants.Ready || c.Reason == constants.Creating) && utils.OptionalBool(instance.Spec.Db.Create)
+func (i deployAction) CanHandle(ctx context.Context, instance *rhtasv1.Trillian) bool {
+	return enabled(instance) && state.FromInstance(instance, constants.ReadyCondition) >= state.Creating
 }
 
-func (i deployAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Trillian) *action.Result {
+func (i deployAction) Handle(ctx context.Context, instance *rhtasv1.Trillian) *action.Result {
 	var (
-		err     error
-		updated bool
+		err    error
+		result controllerutil.OperationResult
 	)
 
 	labels := labels.For(actions.DbComponentName, actions.DbDeploymentName, instance.Name)
-	scc, err := kubernetes.GetOpenshiftPodSecurityContextRestricted(ctx, i.Client, instance.Namespace)
-	if err != nil {
-		i.Logger.Info("Can't resolve OpenShift scc - using default values", "Error", err.Error(), "Fallback FSGroup", "1001")
-		scc = &v1.PodSecurityContext{FSGroup: utils.Pointer(int64(1001)), FSGroupChangePolicy: utils.Pointer(v1.FSGroupChangeOnRootMismatch)}
-	}
 
-	// TLS
-	switch {
-	case instance.Spec.Db.TLS.CertRef != nil:
-		instance.Status.Db.TLS = instance.Spec.Db.TLS
-	case kubernetes.IsOpenShift():
-		instance.Status.Db.TLS = rhtasv1alpha1.TLS{
-			CertRef: &rhtasv1alpha1.SecretKeySelector{
-				LocalObjectReference: rhtasv1alpha1.LocalObjectReference{Name: instance.Name + "-trillian-db-tls"},
-				Key:                  "tls.crt",
+	if result, err = kubernetes.CreateOrUpdate(ctx, i.Client,
+		&v2.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      actions.DbDeploymentName,
+				Namespace: instance.Namespace,
 			},
-			PrivateKeyRef: &rhtasv1alpha1.SecretKeySelector{
-				LocalObjectReference: rhtasv1alpha1.LocalObjectReference{Name: instance.Name + "-trillian-db-tls"},
-				Key:                  "tls.key",
-			},
-		}
-	default:
-		i.Logger.V(1).Info("Communication to trillian-db is insecure")
+		},
+		i.ensureDbDeployment(instance, actions.RBACDbName, labels),
+		deployment.PodSecurityContext(),
+		deployment.GODEBUG(instance.GetAnnotations()),
+		ensure.ControllerReference[*v2.Deployment](instance, i.Client),
+		ensure.Labels[*v2.Deployment](slices.Collect(maps.Keys(labels)), labels),
+		ensure.Optional(trillianUtils.UseTLSDb(instance), i.ensureTLS(statusTLS(instance))),
+	); err != nil {
+		return i.Error(ctx, fmt.Errorf("could not create Trillian DB: %w", err), instance, metav1.Condition{
+			Type:    actions.DbCondition,
+			Status:  metav1.ConditionFalse,
+			Reason:  state.Failure.String(),
+			Message: err.Error(),
+		})
 	}
 
-	useTLS := trillianUtils.UseTLS(instance)
-	db, err := trillianUtils.CreateTrillDb(instance, actions.DbDeploymentName, actions.RBACName, scc, labels, useTLS)
-	if err != nil {
+	if result != controllerutil.OperationResultNone {
 		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
 			Type:    actions.DbCondition,
 			Status:  metav1.ConditionFalse,
-			Reason:  constants.Failure,
-			Message: err.Error(),
-		})
-		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:    constants.Ready,
-			Status:  metav1.ConditionFalse,
-			Reason:  constants.Failure,
-			Message: err.Error(),
-		})
-		return i.FailedWithStatusUpdate(ctx, fmt.Errorf("could not create Trillian DB: %w", err), instance)
-	}
-
-	if err = controllerutil.SetControllerReference(instance, db, i.Client.Scheme()); err != nil {
-		return i.Failed(fmt.Errorf("could not set controller reference for DB Deployment: %w", err))
-	}
-
-	if updated, err = i.Ensure(ctx, db); err != nil {
-		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:    actions.DbCondition,
-			Status:  metav1.ConditionFalse,
-			Reason:  constants.Failure,
-			Message: err.Error(),
-		})
-		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:    constants.Ready,
-			Status:  metav1.ConditionFalse,
-			Reason:  constants.Failure,
-			Message: err.Error(),
-		})
-		return i.FailedWithStatusUpdate(ctx, fmt.Errorf("could not create Trillian DB: %w", err), instance)
-	}
-
-	if updated {
-		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:    actions.DbCondition,
-			Status:  metav1.ConditionFalse,
-			Reason:  constants.Creating,
+			Reason:  state.Creating.String(),
 			Message: "Database deployment created",
 		})
-		return i.StatusUpdate(ctx, instance)
+		return i.ReturnOnChange(i.PersistStatus)(ctx, instance)
 	} else {
 		return i.Continue()
 	}
+}
 
+func (i deployAction) ensureDbDeployment(instance *rhtasv1.Trillian, sa string, labels map[string]string) func(deployment *v2.Deployment) error {
+	return func(dp *v2.Deployment) error {
+		switch {
+		case instance.Status.Db.DatabaseSecretRef == nil:
+			{
+				return errors.New("reference to database secret is not set")
+			}
+		case instance.Status.Db.PvcName == "":
+			{
+				return errors.New("reference to database pvc is not set")
+			}
+		}
+
+		var volumeName = "storage"
+
+		spec := &dp.Spec
+		spec.Replicas = utils.Pointer[int32](1)
+		spec.Selector = &metav1.LabelSelector{
+			MatchLabels: labels,
+		}
+		spec.Strategy = v2.DeploymentStrategy{
+			Type: "Recreate",
+		}
+
+		template := &spec.Template
+		template.Labels = labels
+		template.Spec.ServiceAccountName = sa
+
+		volume := kubernetes.FindVolumeByNameOrCreate(&template.Spec, volumeName)
+		if volume.PersistentVolumeClaim == nil {
+			volume.PersistentVolumeClaim = &v1.PersistentVolumeClaimVolumeSource{}
+		}
+		volume.PersistentVolumeClaim.ClaimName = instance.Status.Db.PvcName
+
+		container := kubernetes.FindContainerByNameOrCreate(&template.Spec, actions.DbDeploymentName)
+		container.Image = images.Registry.Get(images.TrillianDb)
+		container.Command = []string{
+			"run-mysqld",
+		}
+
+		port := kubernetes.FindPortByNameOrCreate(container, "3306-tcp")
+		port.ContainerPort = 3306
+		port.Protocol = v1.ProtocolTCP
+
+		volumeMount := kubernetes.FindVolumeMountByNameOrCreate(container, volumeName)
+		volumeMount.MountPath = "/var/lib/mysql"
+
+		// Env variables from secret DatabaseSecretRef.Name
+		keys := []string{actions.SecretUser, actions.SecretPassword, actions.SecretRootPassword, actions.SecretPort, actions.SecretDatabaseName}
+		for _, v := range keys {
+			temp := strings.ReplaceAll(v, "-", "_")
+			temp = strings.ToUpper(temp)
+
+			userEnv := kubernetes.FindEnvByNameOrCreate(container, temp)
+			userEnv.ValueFrom = &v1.EnvVarSource{
+				SecretKeyRef: &v1.SecretKeySelector{
+					Key: v,
+					LocalObjectReference: v1.LocalObjectReference{
+						Name: instance.Status.Db.DatabaseSecretRef.Name,
+					},
+				},
+			}
+		}
+
+		if container.ReadinessProbe == nil {
+			container.ReadinessProbe = &v1.Probe{}
+		}
+		if container.ReadinessProbe.Exec == nil {
+			container.ReadinessProbe.Exec = &v1.ExecAction{}
+		}
+
+		container.ReadinessProbe.Exec.Command = []string{"bash", "-c", readinessCommand} //nolint:goconst
+		container.ReadinessProbe.InitialDelaySeconds = 0
+		container.ReadinessProbe.PeriodSeconds = 10
+		container.ReadinessProbe.TimeoutSeconds = 1
+		container.ReadinessProbe.FailureThreshold = 3
+
+		if container.LivenessProbe == nil {
+			container.LivenessProbe = &v1.Probe{}
+		}
+		if container.LivenessProbe.Exec == nil {
+			container.LivenessProbe.Exec = &v1.ExecAction{}
+		}
+		container.LivenessProbe.Exec.Command = []string{"bash", "-c", livenessCommand}
+		container.LivenessProbe.InitialDelaySeconds = 0
+		container.LivenessProbe.PeriodSeconds = 10
+		container.LivenessProbe.TimeoutSeconds = 1
+		container.LivenessProbe.FailureThreshold = 3
+
+		if container.StartupProbe == nil {
+			container.StartupProbe = &v1.Probe{}
+		}
+		if container.StartupProbe.Exec == nil {
+			container.StartupProbe.Exec = &v1.ExecAction{}
+		}
+		container.StartupProbe.Exec.Command = []string{"bash", "-c", readinessCommand}
+		container.StartupProbe.PeriodSeconds = 5
+		container.StartupProbe.TimeoutSeconds = 5
+		container.StartupProbe.FailureThreshold = 24
+
+		return nil
+	}
+}
+
+func (i deployAction) ensureTLS(tlsConfig rhtasv1.TLS) func(deployment *v2.Deployment) error {
+	return func(dp *v2.Deployment) error {
+		if err := deployment.TLS(tlsConfig, actions.DbDeploymentName)(dp); err != nil {
+			return err
+		}
+
+		container := kubernetes.FindContainerByNameOrCreate(&dp.Spec.Template.Spec, actions.DbDeploymentName)
+
+		if container.ReadinessProbe == nil {
+			container.ReadinessProbe = &v1.Probe{}
+		}
+		if container.ReadinessProbe.Exec == nil {
+			container.ReadinessProbe.Exec = &v1.ExecAction{}
+		}
+
+		container.ReadinessProbe.Exec.Command = []string{"bash", "-c", readinessCommand + " --ssl"}
+
+		if container.LivenessProbe == nil {
+			container.LivenessProbe = &v1.Probe{}
+		}
+		if container.LivenessProbe.Exec == nil {
+			container.LivenessProbe.Exec = &v1.ExecAction{}
+		}
+
+		container.LivenessProbe.Exec.Command = []string{"bash", "-c", livenessCommand + " --ssl"}
+
+		if container.StartupProbe == nil {
+			container.StartupProbe = &v1.Probe{}
+		}
+		if container.StartupProbe.Exec == nil {
+			container.StartupProbe.Exec = &v1.ExecAction{}
+		}
+		container.StartupProbe.Exec.Command = []string{"bash", "-c", readinessCommand + " --ssl"}
+
+		if i := slices.Index(container.Args, "--ssl-cert"); i == -1 {
+			container.Args = append(container.Args, "--ssl-cert", tls.TLSCertPath)
+		} else {
+			if len(container.Args)-1 < i+1 {
+				container.Args = append(container.Args, tls.TLSCertPath)
+			}
+			container.Args[i+1] = tls.TLSCertPath
+		}
+
+		if i := slices.Index(container.Args, "--ssl-key"); i == -1 {
+			container.Args = append(container.Args, "--ssl-key", tls.TLSKeyPath)
+		} else {
+			if len(container.Args)-1 < i+1 {
+				container.Args = append(container.Args, tls.TLSKeyPath)
+			}
+			container.Args[i+1] = tls.TLSKeyPath
+		}
+		return nil
+	}
 }

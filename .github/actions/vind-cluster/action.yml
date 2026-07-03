@@ -1,0 +1,192 @@
+name: 'Install and configure vind cluster'
+description: 'Create a vind (vCluster in Docker) cluster from a preconfigured snapshot'
+
+inputs:
+  olm:
+    description: 'expect OLM in the snapshot'
+    required: true
+    default: 'false'
+  keycloak:
+    description: 'expect Keycloak in the snapshot'
+    required: true
+    default: 'false'
+  prometheus:
+    description: 'expect Prometheus in the snapshot'
+    required: true
+    default: 'false'
+  nfs-csi:
+    description: 'install nfs-csi (post-restore)'
+    required: false
+    default: 'false'
+  snapshot-registry:
+    description: 'OCI registry for vind snapshots'
+    required: false
+    default: 'ghcr.io/securesign/operator-vind-snapshot'
+  vcluster-version:
+    description: 'vCluster CLI version'
+    required: false
+    default: 'v0.35.1'
+  kubernetes-version:
+    description: 'Kubernetes version for the cluster'
+    required: false
+    default: '1.35.0'
+
+outputs:
+  oidc_host:
+    value: ${{ steps.set-oidc.outputs.oidc_host }}
+    description: 'Keycloak OIDC host'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install vCluster CLI
+      shell: bash
+      run: |
+        curl -fsSL "https://github.com/loft-sh/vcluster/releases/download/${{ inputs.vcluster-version }}/vcluster-linux-amd64" \
+          -o /usr/local/bin/vcluster
+        chmod +x /usr/local/bin/vcluster
+        vcluster --version
+
+    - name: Sync registry auth to Docker config
+      shell: bash
+      run: |
+        mkdir -p ~/.docker
+        if [ -f /tmp/config.json ]; then
+          cp /tmp/config.json ~/.docker/config.json
+        fi
+
+    - name: Verify Docker containerd image storage
+      shell: bash
+      run: |
+        if docker info 2>/dev/null | grep -q "driver: overlayfs"; then
+          echo "Docker is using containerd snapshotter — registry proxy will work"
+        else
+          echo "::warning::Docker may not be using containerd snapshotter. Registry proxy may not share images."
+        fi
+
+    - name: Select snapshot tag
+      id: snapshot
+      shell: bash
+      run: |
+        if [ "${{ inputs.olm }}" = "true" ] || [ "${{ inputs.keycloak }}" = "true" ] || [ "${{ inputs.prometheus }}" = "true" ]; then
+          echo "tag=full" >> $GITHUB_OUTPUT
+        else
+          echo "tag=minimal" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Pre-cache common component images
+      shell: bash
+      run: |
+        docker pull registry.k8s.io/ingress-nginx/controller:v1.14.3 &
+        docker pull registry.k8s.io/ingress-nginx/kube-webhook-certgen:v1.5.3 &
+        docker pull quay.io/jetstack/cert-manager-controller:v1.20.2 &
+        docker pull quay.io/jetstack/cert-manager-webhook:v1.20.2 &
+        docker pull quay.io/jetstack/cert-manager-cainjector:v1.20.2 &
+        wait
+
+    - name: Pre-cache Keycloak images
+      if: ${{ inputs.keycloak == 'true' }}
+      shell: bash
+      run: |
+        docker pull postgres:15 &
+        docker pull quay.io/keycloak/keycloak-operator:26.5.3 &
+        docker pull quay.io/keycloak/keycloak:26.5.3 &
+        wait
+
+    - name: Create vind cluster from snapshot
+      shell: bash
+      run: |
+        vcluster use driver docker
+        vcluster create ci-cluster \
+          --restore "oci://${{ inputs.snapshot-registry }}:${{ steps.snapshot.outputs.tag }}" \
+          --values ci/vcluster.yaml \
+          --kubernetes-version ${{ inputs.kubernetes-version }}
+
+    - name: Wait for ingress-nginx
+      shell: bash
+      run: |
+        kubectl wait --namespace ingress-nginx \
+          --for=condition=ready pod \
+          --selector=app.kubernetes.io/component=controller \
+          --timeout=300s
+
+    - name: Wait for cert-manager
+      shell: bash
+      run: |
+        kubectl wait --for=condition=Available deployment/cert-manager -n cert-manager --timeout=120s
+        kubectl wait --for=condition=Available deployment/cert-manager-webhook -n cert-manager --timeout=120s
+        kubectl wait --for=condition=Available deployment/cert-manager-cainjector -n cert-manager --timeout=120s
+
+    - name: Verify cert-manager webhook is serving
+      shell: bash
+      run: |
+        for i in $(seq 1 30); do
+          if kubectl get --raw /api/v1/namespaces/cert-manager/services/cert-manager-webhook:https/proxy/healthz 2>/dev/null; then
+            echo "cert-manager webhook is ready"
+            break
+          fi
+          echo "Waiting for cert-manager webhook... ($i/30)"
+          sleep 2
+        done
+
+    - name: Wait for OLM
+      if: ${{ inputs.olm == 'true' }}
+      shell: bash
+      run: |
+        kubectl wait --for=condition=Available deployment/olm-operator -n olm --timeout=120s
+        kubectl wait --for=condition=Available deployment/catalog-operator -n olm --timeout=120s
+
+    - name: Wait for Keycloak
+      if: ${{ inputs.keycloak == 'true' }}
+      shell: bash
+      run: |
+        kubectl wait --for=condition=Available deployment/keycloak-operator -n keycloak-system --timeout=120s
+        kubectl rollout status statefulset/postgresql-db -n keycloak-system --timeout=120s
+        for i in $(seq 1 30); do
+          READY=$(kubectl get keycloak -n keycloak-system -o jsonpath='{.items[0].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
+          if [ "$READY" = "True" ]; then
+            echo "Keycloak is ready"
+            break
+          fi
+          echo "Waiting for Keycloak... ($i/30)"
+          sleep 10
+        done
+
+    - name: Re-import Keycloak realm after snapshot restore
+      if: ${{ inputs.keycloak == 'true' }}
+      shell: bash
+      run: |
+        kubectl delete keycloakrealmimport trusted-artifact-signer-realm \
+          -n keycloak-system --ignore-not-found
+        kustomize build ci/keycloak/resources/overlay/kind/ \
+          | kubectl apply -f - --selector='app.kubernetes.io/name!=keycloak,app.kubernetes.io/name!=postgresql' \
+          || kubectl apply -f ci/keycloak/resources/base/realm-import.yaml -n keycloak-system
+        for i in $(seq 1 30); do
+          STATUS=$(kubectl get keycloakrealmimport trusted-artifact-signer-realm \
+            -n keycloak-system \
+            -o jsonpath='{.status.conditions[?(@.type=="Done")].status}' 2>/dev/null)
+          if [ "$STATUS" = "True" ]; then
+            echo "Realm import completed"
+            break
+          fi
+          echo "Waiting for realm import... ($i/30)"
+          sleep 10
+        done
+
+    - name: Wait for Prometheus Operator
+      if: ${{ inputs.prometheus == 'true' }}
+      shell: bash
+      run: |
+        kubectl wait --for=condition=Ready pods -l app.kubernetes.io/name=prometheus-operator -n default --timeout=90s
+
+    - name: Set OIDC output
+      if: ${{ inputs.keycloak == 'true' }}
+      id: set-oidc
+      shell: bash
+      run: echo "oidc_host=keycloak-internal.keycloak-system.svc" >> $GITHUB_OUTPUT
+
+    - name: Install NFS-CSI
+      if: ${{ inputs.nfs-csi == 'true' }}
+      shell: bash
+      run: |
+        kustomize build --enable-helm ./ci/nfs/overlay/ | kubectl apply -f -

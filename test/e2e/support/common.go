@@ -3,6 +3,7 @@ package support
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -12,12 +13,14 @@ import (
 	"strings"
 
 	routev1 "github.com/openshift/api/route/v1"
-	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	v12 "k8s.io/api/apps/v1"
 	v13 "k8s.io/api/batch/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
+	"sigs.k8s.io/yaml"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/random"
@@ -26,17 +29,13 @@ import (
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/ginkgo/v2/dsl/core"
 	. "github.com/onsi/gomega"
-	olm "github.com/operator-framework/api/pkg/operators/v1"
-	olmAlpha "github.com/operator-framework/api/pkg/operators/v1alpha1"
+	rhtasv1 "github.com/securesign/operator/api/v1"
 	"github.com/securesign/operator/api/v1alpha1"
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	"gopkg.in/yaml.v2"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/json"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	runtimeCli "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func IsCIEnvironment() bool {
@@ -47,24 +46,42 @@ func IsCIEnvironment() bool {
 	return false
 }
 
-func CreateClient() (runtimeCli.Client, error) {
+func CreateClient() (client.Client, error) {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-	utilruntime.Must(monitoringv1.AddToScheme(scheme))
-	utilruntime.Must(rhtasv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(rhtasv1.AddToScheme(scheme))
+	utilruntime.Must(v1alpha1.AddToScheme(scheme))
 	utilruntime.Must(routev1.AddToScheme(scheme))
-	utilruntime.Must(olmAlpha.AddToScheme(scheme))
-	utilruntime.Must(olm.AddToScheme(scheme))
 
 	cfg, err := config.GetConfig()
 	if err != nil {
 		return nil, err
 	}
 
-	return runtimeCli.New(cfg, runtimeCli.Options{Scheme: scheme})
+	return client.New(cfg, client.Options{Scheme: scheme})
 
 }
 func CreateTestNamespace(ctx context.Context, cli client.Client) *v1.Namespace {
+	return createTestNamespace(ctx, cli, true)
+}
+
+func CreateTestNamespaceWithoutPSA(ctx context.Context, cli client.Client) *v1.Namespace {
+	return createTestNamespace(ctx, cli, false)
+}
+
+func EnforcePSARestricted(ctx context.Context, cli client.Client, ns *v1.Namespace) {
+	Eventually(func(g Gomega) {
+		g.Expect(cli.Get(ctx, client.ObjectKeyFromObject(ns), ns)).To(Succeed())
+		if ns.Labels == nil {
+			ns.Labels = map[string]string{}
+		}
+		ns.Labels["pod-security.kubernetes.io/enforce"] = "restricted"
+		ns.Labels["pod-security.kubernetes.io/enforce-version"] = "latest"
+		g.Expect(cli.Update(ctx, ns)).To(Succeed())
+	}).Should(Succeed())
+}
+
+func createTestNamespace(ctx context.Context, cli client.Client, withPSA bool) *v1.Namespace {
 	sp := ginkgo.CurrentSpecReport()
 	fn := filepath.Base(sp.LeafNodeLocation.FileName)
 	// Replace invalid characters with '-'
@@ -74,7 +91,12 @@ func CreateTestNamespace(ctx context.Context, cli client.Client) *v1.Namespace {
 	ns := &v1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: name + "-",
+			Labels:       map[string]string{},
 		},
+	}
+	if withPSA {
+		ns.Labels["pod-security.kubernetes.io/enforce"] = "restricted"
+		ns.Labels["pod-security.kubernetes.io/enforce-version"] = "latest"
 	}
 	Expect(cli.Create(ctx, ns)).To(Succeed())
 	core.GinkgoWriter.Println("Created test namespace: " + ns.Name)
@@ -122,20 +144,25 @@ func DumpNamespace(ctx context.Context, cli client.Client, ns string) {
 	// Example usage with mock data
 	k8s := map[string]logTarget{}
 
+	secretList := &metav1.PartialObjectMetadataList{}
+	gvk := schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Secret"}
+	secretList.SetGroupVersionKind(gvk)
+
 	toDump := map[string]client.ObjectList{
-		"securesign.yaml": &v1alpha1.SecuresignList{},
-		"fulcio.yaml":     &v1alpha1.FulcioList{},
-		"rekor.yaml":      &v1alpha1.RekorList{},
-		"tuf.yaml":        &v1alpha1.TufList{},
-		"ctlog.yaml":      &v1alpha1.CTlogList{},
-		"trillian.yaml":   &v1alpha1.TrillianList{},
-		"tsa.yaml":        &v1alpha1.TimestampAuthorityList{},
+		"securesign.yaml": &rhtasv1.SecuresignList{},
+		"fulcio.yaml":     &rhtasv1.FulcioList{},
+		"rekor.yaml":      &rhtasv1.RekorList{},
+		"tuf.yaml":        &rhtasv1.TufList{},
+		"ctlog.yaml":      &rhtasv1.CTlogList{},
+		"trillian.yaml":   &rhtasv1.TrillianList{},
+		"tsa.yaml":        &rhtasv1.TimestampAuthorityList{},
 		"pod.yaml":        &v1.PodList{},
 		"configmap.yaml":  &v1.ConfigMapList{},
 		"deployment.yaml": &v12.DeploymentList{},
 		"job.yaml":        &v13.JobList{},
 		"cronjob.yaml":    &v13.CronJobList{},
 		"event.yaml":      &v1.EventList{},
+		"secret.yaml":     secretList,
 	}
 
 	core.GinkgoWriter.Println("----------------------- Dumping namespace " + ns + " -----------------------")
@@ -151,6 +178,12 @@ func DumpNamespace(ctx context.Context, cli client.Client, ns string) {
 		}
 	}
 
+	// Retrieve logs for all pods (in the namespace)
+	podLogFiles := retrievePodLogs(ctx, cli, ns)
+	for k, v := range podLogFiles {
+		k8s[k] = v
+	}
+
 	// Create the output file
 	fileName := "k8s-dump-" + ns + ".tar.gz"
 	outFile, err := os.Create(fileName)
@@ -161,6 +194,59 @@ func DumpNamespace(ctx context.Context, cli client.Client, ns string) {
 	if err := createArchive(outFile, k8s); err != nil {
 		log.Fatalf("Failed to create %s: %v", fileName, err)
 	}
+}
+
+func retrievePodLogs(ctx context.Context, cli client.Client, ns string) map[string]logTarget {
+	podLogs := make(map[string]logTarget)
+
+	podList := &v1.PodList{}
+	if err := cli.List(ctx, podList, client.InNamespace(ns)); err != nil {
+		log.Printf("failed to list pods in namespace %q: %v", ns, err)
+		return podLogs
+	}
+
+	restCfg, err := config.GetConfig()
+	if err != nil {
+		log.Printf("failed to retrieve REST configuration: %v", err)
+		return podLogs
+	}
+	clientset, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		log.Printf("failed to create Kubernetes clientset: %v", err)
+		return podLogs
+	}
+
+	for _, pod := range podList.Items {
+		podLogOptions := v1.PodLogOptions{}
+		req := clientset.CoreV1().Pods(ns).GetLogs(pod.Name, &podLogOptions)
+
+		stream, err := req.Stream(ctx)
+		if err != nil {
+			// Ensure we close the stream if it is non-nil
+			if stream != nil {
+				_ = stream.Close()
+			}
+			log.Printf("failed to open log stream for pod %q: %v", pod.Name, err)
+			continue
+		}
+
+		logData, err := io.ReadAll(stream)
+		if closeErr := stream.Close(); closeErr != nil {
+			log.Printf("failed to close log stream for pod %q: %v", pod.Name, closeErr)
+		}
+		if err != nil {
+			log.Printf("failed to read log stream for pod %q: %v", pod.Name, err)
+			continue
+		}
+
+		fileKey := "pod-logs/" + pod.Name + ".log"
+		podLogs[fileKey] = logTarget{
+			reader: strings.NewReader(string(logData)),
+			size:   int64(len(logData)),
+		}
+	}
+
+	return podLogs
 }
 
 func dumpK8sObjects(ctx context.Context, cli client.Client, list client.ObjectList, namespace string) (string, error) {

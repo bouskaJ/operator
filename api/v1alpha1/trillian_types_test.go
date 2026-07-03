@@ -1,9 +1,11 @@
 package v1alpha1
 
 import (
+	"context"
+	"math"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"golang.org/x/net/context"
 	_ "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	k8sresource "k8s.io/apimachinery/pkg/api/resource"
@@ -87,17 +89,6 @@ var _ = Describe("Trillian", func() {
 						Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
 					})
 				})
-
-				It("false", func() {
-					By("databaseSecretRef is mandatory", func() {
-						invalidObject := generateTrillianObject("database-secret-2")
-						invalidObject.Spec.Db.Create = ptr.To(false)
-						invalidObject.Spec.Db.DatabaseSecretRef = nil
-						Expect(apierrors.IsInvalid(k8sClient.Create(context.Background(), invalidObject))).To(BeTrue())
-						Expect(k8sClient.Create(context.Background(), invalidObject)).
-							To(MatchError(ContainSubstring("databaseSecretRef cannot be empty")))
-					})
-				})
 			})
 
 			It("checking pvc name", func() {
@@ -107,7 +98,79 @@ var _ = Describe("Trillian", func() {
 				Expect(k8sClient.Create(context.Background(), invalidObject)).
 					To(MatchError(ContainSubstring("spec.database.pvc.name in body should match")))
 			})
+
+			When("replicas", func() {
+				It("nil", func() {
+					validObject := generateTrillianObject("replicas-nil")
+					validObject.Spec.LogServer.Replicas = nil
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+				})
+
+				It("positive", func() {
+					validObject := generateTrillianObject("replicas-positive")
+					validObject.Spec.LogServer.Replicas = ptr.To(int32(math.MaxInt32))
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+				})
+
+				It("negative", func() {
+					invalidObject := generateTrillianObject("replicas-negative")
+					invalidObject.Spec.LogServer.Replicas = ptr.To(int32(-1))
+					Expect(apierrors.IsInvalid(k8sClient.Create(context.Background(), invalidObject))).To(BeTrue())
+					Expect(k8sClient.Create(context.Background(), invalidObject)).
+						To(MatchError(ContainSubstring("spec.server.replicas in body should be greater than or equal to 0")))
+				})
+
+				It("zero", func() {
+					validObject := generateTrillianObject("replicas-zero")
+					validObject.Spec.LogServer.Replicas = ptr.To(int32(0))
+					Expect(k8sClient.Create(context.Background(), validObject)).To(Succeed())
+				})
+			})
 		})
+
+		type pvcArgs struct {
+			name         string
+			storageClass string
+			accessModes  []PersistentVolumeAccessMode
+		}
+		DescribeTable("pvc", func(ctx context.Context, origObj pvcArgs, updateObj *pvcArgs, isValid bool, errMessage string) {
+			object := generateTrillianObject("")
+			object.GenerateName = "trillian-pvc-"
+			object.Spec.Db.Pvc.Name = origObj.name
+			object.Spec.Db.Pvc.StorageClass = origObj.storageClass
+			object.Spec.Db.Pvc.AccessModes = origObj.accessModes
+
+			err := k8sClient.Create(ctx, object)
+			if updateObj == nil && !isValid {
+				Expect(err).To(MatchError(ContainSubstring(errMessage)))
+				return
+			}
+			Expect(err).To(Succeed())
+			if updateObj == nil {
+				return
+			}
+
+			object.Spec.Db.Pvc.Name = updateObj.name
+			object.Spec.Db.Pvc.StorageClass = updateObj.storageClass
+			object.Spec.Db.Pvc.AccessModes = updateObj.accessModes
+
+			if isValid {
+				Expect(k8sClient.Update(ctx, object)).To(Succeed())
+			} else {
+				Expect(k8sClient.Update(ctx, object)).To(MatchError(ContainSubstring(errMessage)))
+			}
+		},
+			Entry("create default", pvcArgs{}, nil, true, ""),
+			Entry("bring your own pvc", pvcArgs{name: "byo-pvc"}, nil, true, ""),
+			Entry("change name", pvcArgs{}, &pvcArgs{name: "new"}, true, ""),
+			Entry("no changes", pvcArgs{storageClass: "default", accessModes: []PersistentVolumeAccessMode{"ReadWriteOnce"}}, &pvcArgs{storageClass: "default", accessModes: []PersistentVolumeAccessMode{"ReadWriteOnce"}}, true, ""),
+			Entry("immutable storageClass", pvcArgs{storageClass: "default"}, &pvcArgs{storageClass: "new"}, false, "storageClass is immutable"),
+			Entry("change storageClass when name is set", pvcArgs{name: "named", storageClass: "old"}, &pvcArgs{name: "named", storageClass: "new"}, true, ""),
+			Entry("change storageClass and name", pvcArgs{storageClass: "old"}, &pvcArgs{name: "new", storageClass: "new"}, true, ""),
+			Entry("immutable accessModes", pvcArgs{accessModes: []PersistentVolumeAccessMode{"ReadWriteOnce"}}, &pvcArgs{accessModes: []PersistentVolumeAccessMode{"ReadWriteMany"}}, false, "accessModes is immutable"),
+			Entry("change accessModes when name is set", pvcArgs{name: "named", accessModes: []PersistentVolumeAccessMode{"ReadWriteOnce"}}, &pvcArgs{name: "named", accessModes: []PersistentVolumeAccessMode{"ReadWriteOnce", "ReadWriteMany"}}, true, ""),
+			Entry("change accessModes and name", pvcArgs{accessModes: []PersistentVolumeAccessMode{"ReadWriteOnce"}}, &pvcArgs{name: "new", accessModes: []PersistentVolumeAccessMode{"ReadWriteOnce", "ReadWriteMany"}}, true, ""),
+		)
 
 		Context("Default settings", func() {
 			var (
@@ -214,7 +277,20 @@ func generateTrillianObject(name string) *Trillian {
 					Size:        &storage,
 					AccessModes: []PersistentVolumeAccessMode{"ReadWriteOnce"},
 				},
+				Provider: "mysql",
+				Uri:      "$(MYSQL_USER):$(MYSQL_PASSWORD)@tcp($(MYSQL_HOST):$(MYSQL_PORT))/$(MYSQL_DATABASE)",
 			},
+			LogServer: TrillianLogServer{
+				PodRequirements: PodRequirements{
+					Replicas: ptr.To(int32(1)),
+				},
+			},
+			LogSigner: TrillianLogSigner{
+				PodRequirements: PodRequirements{
+					Replicas: ptr.To(int32(1)),
+				},
+			},
+			MaxRecvMessageSize: ptr.To(int64(153600)),
 		},
 	}
 }

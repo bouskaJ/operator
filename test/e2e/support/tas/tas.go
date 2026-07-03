@@ -2,76 +2,118 @@ package tas
 
 import (
 	"context"
-	"time"
-
-	"github.com/securesign/operator/test/e2e/support/tas/tsa"
+	"strings"
 
 	. "github.com/onsi/gomega"
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/test/e2e/support"
-	clients "github.com/securesign/operator/test/e2e/support/tas/cli"
+	"github.com/securesign/operator/test/e2e/support/tas/cosign"
+	"github.com/securesign/operator/test/e2e/support/tas/securesign"
+	"github.com/securesign/operator/test/e2e/support/tas/tsa"
+
+	rhtasv1 "github.com/securesign/operator/api/v1"
 	"github.com/securesign/operator/test/e2e/support/tas/ctlog"
 	"github.com/securesign/operator/test/e2e/support/tas/fulcio"
 	"github.com/securesign/operator/test/e2e/support/tas/rekor"
-	"github.com/securesign/operator/test/e2e/support/tas/securesign"
 	"github.com/securesign/operator/test/e2e/support/tas/trillian"
 	"github.com/securesign/operator/test/e2e/support/tas/tuf"
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	runtimeCli "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-func VerifyAllComponents(ctx context.Context, cli runtimeCli.Client, s *rhtasv1alpha1.Securesign, dbPresent bool) {
-	securesign.Verify(ctx, cli, s.Namespace, s.Name)
-	trillian.Verify(ctx, cli, s.Namespace, s.Name, dbPresent)
-	fulcio.Verify(ctx, cli, s.Namespace, s.Name)
-	tsa.Verify(ctx, cli, s.Namespace, s.Name)
-	rekor.Verify(ctx, cli, s.Namespace, s.Name)
-	ctlog.Verify(ctx, cli, s.Namespace, s.Name)
-	tuf.Verify(ctx, cli, s.Namespace, s.Name)
+var (
+	kinds = []string{
+		"Securesign",
+		"Trillian",
+		"Fulcio",
+		"Rekor",
+		"CTlog",
+		"Tuf",
+		"TimestampAuthority",
+	}
+	gv = rhtasv1.GroupVersion
+)
+
+func waitForCRD(cli runtimeCli.Client, gv schema.GroupVersion, kind string) {
+	Eventually(func() error {
+		mapper := cli.RESTMapper()
+
+		_, err := mapper.RESTMapping(schema.GroupKind{Group: gv.Group, Kind: kind}, gv.Version)
+		if err != nil {
+			// We must invalidate the cache so the next tick actually queries the API server.
+			meta.MaybeResetRESTMapper(mapper)
+			return err
+		}
+
+		return nil
+	}).Should(Succeed(), "Timed out waiting for RESTMapping of %s", kind)
 }
 
-func VerifyByCosign(ctx context.Context, cli runtimeCli.Client, s *rhtasv1alpha1.Securesign, targetImageName string) {
-	f := fulcio.Get(ctx, cli, s.Namespace, s.Name)()
-	Expect(f).ToNot(BeNil())
+func VerifyCRDRESTEndpoints(ctx context.Context, cli runtimeCli.Client) {
+	VerifyCRDRESTEndpointsForVersion(ctx, cli, gv)
+}
 
-	r := rekor.Get(ctx, cli, s.Namespace, s.Name)()
-	Expect(r).ToNot(BeNil())
+func VerifyCRDRESTEndpointsForVersion(ctx context.Context, cli runtimeCli.Client, version schema.GroupVersion) {
+	for _, kind := range kinds {
+		waitForCRD(cli, version, kind)
+	}
+}
 
-	t := tuf.Get(ctx, cli, s.Namespace, s.Name)()
-	Expect(t).ToNot(BeNil())
+func VerifyAllComponents(ctx context.Context, cli runtimeCli.Client, s *rhtasv1.Securesign, trillianDBPresent bool, rekorRedisPresent bool) {
+	trillian.Verify(ctx, cli, s.Namespace, s.Name, trillianDBPresent)
+	fulcio.Verify(ctx, cli, s.Namespace, s.Name)
+	tsa.Verify(ctx, cli, s.Namespace, s.Name)
+	rekor.Verify(ctx, cli, s.Namespace, s.Name, rekorRedisPresent)
+	ctlog.Verify(ctx, cli, s.Namespace, s.Name)
+	tuf.Verify(ctx, cli, s.Namespace, s.Name)
+	securesign.Verify(ctx, cli, s.Namespace, s.Name)
+}
 
-	ts := tsa.Get(ctx, cli, s.Namespace, s.Name)()
-	Expect(ts).ToNot(BeNil())
+func withPathAndCABundle(path string) OmegaMatcher {
+	hasPath := WithTransform(func(w admissionregistrationv1.MutatingWebhook) string {
+		return *w.ClientConfig.Service.Path
+	}, Equal(path))
+	hasCABundle := WithTransform(func(w admissionregistrationv1.MutatingWebhook) []byte {
+		return w.ClientConfig.CABundle
+	}, Not(BeEmpty()))
+	return And(hasPath, hasCABundle)
+}
 
-	Eventually(func() error {
-		return tsa.GetCertificateChain(ctx, cli, s.Namespace, s.Name, ts.Status.Url)
+func VerifyWebhook(ctx context.Context, cli runtimeCli.Client) {
+	Eventually(func(g Gomega) {
+		mwcList := &admissionregistrationv1.MutatingWebhookConfigurationList{}
+		g.Expect(cli.List(ctx, mwcList)).To(Succeed())
+
+		// Collect all webhook paths and CABundles across all MWCs.
+		// Kustomize creates a single MWC with all 7 webhooks;
+		// OLM creates a separate MWC per webhook definition.
+		g.Expect(mwcList.Items).To(WithTransform(
+			func(items []admissionregistrationv1.MutatingWebhookConfiguration) []admissionregistrationv1.MutatingWebhook {
+				var all []admissionregistrationv1.MutatingWebhook
+				for _, mwc := range items {
+					for _, w := range mwc.Webhooks {
+						if w.ClientConfig.Service != nil && w.ClientConfig.Service.Path != nil &&
+							strings.HasPrefix(*w.ClientConfig.Service.Path, "/mutate-rhtas-redhat-com-") {
+							all = append(all, w)
+						}
+					}
+				}
+				return all
+			},
+			ContainElements(
+				withPathAndCABundle("/mutate-rhtas-redhat-com-v1-ctlog"),
+				withPathAndCABundle("/mutate-rhtas-redhat-com-v1-fulcio"),
+				withPathAndCABundle("/mutate-rhtas-redhat-com-v1-rekor"),
+				withPathAndCABundle("/mutate-rhtas-redhat-com-v1-securesign"),
+				withPathAndCABundle("/mutate-rhtas-redhat-com-v1-timestampauthority"),
+				withPathAndCABundle("/mutate-rhtas-redhat-com-v1-trillian"),
+				withPathAndCABundle("/mutate-rhtas-redhat-com-v1-tuf"),
+			),
+		))
 	}).Should(Succeed())
+}
 
-	oidcToken, err := support.OidcToken(ctx)
-	Expect(err).ToNot(HaveOccurred())
-	Expect(oidcToken).ToNot(BeEmpty())
-
-	// sleep for a while to be sure everything has settled down
-	time.Sleep(time.Duration(10) * time.Second)
-
-	Expect(clients.Execute("cosign", "initialize", "--mirror="+t.Status.Url, "--root="+t.Status.Url+"/root.json")).To(Succeed())
-
-	Expect(clients.Execute(
-		"cosign", "sign", "-y",
-		"--fulcio-url="+f.Status.Url,
-		"--rekor-url="+r.Status.Url,
-		"--timestamp-server-url="+ts.Status.Url+"/api/v1/timestamp",
-		"--oidc-issuer="+support.OidcIssuerUrl(),
-		"--oidc-client-id="+support.OidcClientID(),
-		"--identity-token="+oidcToken,
-		targetImageName,
-	)).To(Succeed())
-
-	Expect(clients.Execute(
-		"cosign", "verify",
-		"--rekor-url="+r.Status.Url,
-		"--timestamp-certificate-chain=ts_chain.pem",
-		"--certificate-identity-regexp", ".*@redhat",
-		"--certificate-oidc-issuer-regexp", ".*keycloak.*",
-		targetImageName,
-	)).To(Succeed())
+func VerifyByCosign(ctx context.Context, targetImageName string, tufUrl, fulcioUrl, rekorUrl, tsaUrl string) {
+	// use local cosign as default option
+	cosign.NewLocalCosign(tufUrl, fulcioUrl, rekorUrl, tsaUrl).VerifyByCosign(ctx, targetImageName)
 }

@@ -3,17 +3,19 @@ package actions
 import (
 	"context"
 	"errors"
+	"time"
 
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/common/action"
-	commonUtils "github.com/securesign/operator/internal/controller/common/utils/kubernetes"
-	"github.com/securesign/operator/internal/controller/constants"
-	"github.com/securesign/operator/internal/controller/labels"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/constants"
+	"github.com/securesign/operator/internal/labels"
+	"github.com/securesign/operator/internal/state"
+	commonUtils "github.com/securesign/operator/internal/utils/kubernetes"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func NewInitializeAction() action.Action[*rhtasv1alpha1.CTlog] {
+func NewInitializeAction() action.Action[*rhtasv1.CTlog] {
 	return &initializeAction{}
 }
 
@@ -25,12 +27,11 @@ func (i initializeAction) Name() string {
 	return "initialize"
 }
 
-func (i initializeAction) CanHandle(_ context.Context, instance *rhtasv1alpha1.CTlog) bool {
-	c := meta.FindStatusCondition(instance.Status.Conditions, constants.Ready)
-	return c.Reason == constants.Initialize
+func (i initializeAction) CanHandle(_ context.Context, instance *rhtasv1.CTlog) bool {
+	return state.FromInstance(instance, constants.ReadyCondition) == state.Initialize
 }
 
-func (i initializeAction) Handle(ctx context.Context, instance *rhtasv1alpha1.CTlog) *action.Result {
+func (i initializeAction) Handle(ctx context.Context, instance *rhtasv1.CTlog) *action.Result {
 	var (
 		ok  bool
 		err error
@@ -39,26 +40,24 @@ func (i initializeAction) Handle(ctx context.Context, instance *rhtasv1alpha1.CT
 	ok, err = commonUtils.DeploymentIsRunning(ctx, i.Client, instance.Namespace, labels)
 	switch {
 	case errors.Is(err, commonUtils.ErrDeploymentNotReady):
-		i.Logger.Error(err, "deployment is not ready")
+		i.Logger.Info("deployment is not ready", "error", err.Error())
 	case err != nil:
-		return i.Failed(err)
+		return i.Error(ctx, err, instance)
 	}
 	if !ok {
 		i.Logger.Info("Waiting for deployment")
 		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:               constants.Ready,
+			Type:               constants.ReadyCondition,
 			Status:             metav1.ConditionFalse,
-			Reason:             constants.Initialize,
+			Reason:             state.Initialize.String(),
 			Message:            "Waiting for deployment to be ready",
 			ObservedGeneration: instance.Generation,
 		})
-		return i.StatusUpdate(ctx, instance)
+		if _, err := i.PersistStatus(ctx, instance); err != nil {
+			return i.Error(ctx, err, instance)
+		}
+		return i.RequeueAfter(5 * time.Second)
 	}
-	meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-		Type:               constants.Ready,
-		Status:             metav1.ConditionTrue,
-		Reason:             constants.Ready,
-		ObservedGeneration: instance.Generation,
-	})
-	return i.StatusUpdate(ctx, instance)
+
+	return i.Continue()
 }

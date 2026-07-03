@@ -2,20 +2,25 @@ package actions
 
 import (
 	"context"
+	"fmt"
+	"maps"
+	"slices"
 
-	"github.com/securesign/operator/internal/controller/annotations"
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/annotations"
+	"github.com/securesign/operator/internal/constants"
+	"github.com/securesign/operator/internal/labels"
+	"github.com/securesign/operator/internal/state"
+	"github.com/securesign/operator/internal/utils/kubernetes"
+	"github.com/securesign/operator/internal/utils/kubernetes/ensure"
 
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/common/action"
-	"github.com/securesign/operator/internal/controller/constants"
-	"github.com/securesign/operator/internal/controller/labels"
+	rhtasv1 "github.com/securesign/operator/api/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
 
-func NewTrillianAction() action.Action[*rhtasv1alpha1.Securesign] {
+func NewTrillianAction() action.Action[*rhtasv1.Securesign] {
 	return &trillianAction{}
 }
 
@@ -27,57 +32,57 @@ func (i trillianAction) Name() string {
 	return "create trillian"
 }
 
-func (i trillianAction) CanHandle(context.Context, *rhtasv1alpha1.Securesign) bool {
+func (i trillianAction) CanHandle(context.Context, *rhtasv1.Securesign) bool {
 	return true
 }
 
-func (i trillianAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Securesign) *action.Result {
+func (i trillianAction) Handle(ctx context.Context, instance *rhtasv1.Securesign) *action.Result {
 	var (
-		err     error
-		updated bool
+		err      error
+		result   controllerutil.OperationResult
+		l        = labels.For("trillian", instance.Name, instance.Name)
+		trillian = &rhtasv1.Trillian{
+			ObjectMeta: v1.ObjectMeta{
+				Name:      instance.Name,
+				Namespace: instance.Namespace,
+			},
+		}
 	)
-	trillian := &rhtasv1alpha1.Trillian{}
 
-	trillian.Name = instance.Name
-	trillian.Namespace = instance.Namespace
-	trillian.Labels = labels.For("trillian", trillian.Name, instance.Name)
-	trillian.Annotations = annotations.FilterInheritable(instance.Annotations)
-
-	trillian.Spec = instance.Spec.Trillian
-
-	if err = controllerutil.SetControllerReference(instance, trillian, i.Client.Scheme()); err != nil {
-		return i.Failed(err)
+	if result, err = kubernetes.CreateOrUpdate(ctx, i.Client,
+		trillian,
+		ensure.ControllerReference[*rhtasv1.Trillian](instance, i.Client),
+		ensure.Labels[*rhtasv1.Trillian](slices.Collect(maps.Keys(l)), l),
+		ensure.Annotations[*rhtasv1.Trillian](annotations.InheritableAnnotations, instance.Annotations),
+		func(object *rhtasv1.Trillian) error {
+			object.Spec = instance.Spec.Trillian
+			return nil
+		},
+	); err != nil {
+		return i.Error(ctx, fmt.Errorf("could not create Trillian: %w", err), instance,
+			v1.Condition{
+				Type:    TrillianCondition,
+				Status:  v1.ConditionFalse,
+				Reason:  state.Failure.String(),
+				Message: err.Error(),
+			})
 	}
 
-	if updated, err = i.Ensure(ctx, trillian); err != nil {
+	if result != controllerutil.OperationResultNone {
 		meta.SetStatusCondition(&instance.Status.Conditions, v1.Condition{
 			Type:    TrillianCondition,
 			Status:  v1.ConditionFalse,
-			Reason:  constants.Failure,
-			Message: err.Error(),
-		})
-		return i.FailedWithStatusUpdate(ctx, err, instance)
-	}
-
-	if updated {
-		meta.SetStatusCondition(&instance.Status.Conditions, v1.Condition{
-			Type:    TrillianCondition,
-			Status:  v1.ConditionFalse,
-			Reason:  constants.Creating,
+			Reason:  state.Creating.String(),
 			Message: "Trillian resource created " + trillian.Name,
 		})
-		return i.StatusUpdate(ctx, instance)
+		return i.ReturnOnChange(i.PersistStatus)(ctx, instance)
 	}
 
-	return i.CopyStatus(ctx, client.ObjectKeyFromObject(trillian), instance)
+	return i.CopyStatus(ctx, trillian, instance)
 }
 
-func (i trillianAction) CopyStatus(ctx context.Context, ok client.ObjectKey, instance *rhtasv1alpha1.Securesign) *action.Result {
-	object := &rhtasv1alpha1.Trillian{}
-	if err := i.Client.Get(ctx, ok, object); err != nil {
-		return i.Failed(err)
-	}
-	objectStatus := meta.FindStatusCondition(object.Status.Conditions, constants.Ready)
+func (i trillianAction) CopyStatus(ctx context.Context, object *rhtasv1.Trillian, instance *rhtasv1.Securesign) *action.Result {
+	objectStatus := meta.FindStatusCondition(object.Status.Conditions, constants.ReadyCondition)
 	if objectStatus == nil {
 		// not initialized yet, wait for update
 		return i.Continue()
@@ -88,7 +93,7 @@ func (i trillianAction) CopyStatus(ctx context.Context, ok client.ObjectKey, ins
 			Status: objectStatus.Status,
 			Reason: objectStatus.Reason,
 		})
-		return i.StatusUpdate(ctx, instance)
+		return i.ReturnOnChange(i.PersistStatus)(ctx, instance)
 	}
 	return i.Continue()
 }

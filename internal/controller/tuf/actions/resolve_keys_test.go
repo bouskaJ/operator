@@ -6,21 +6,22 @@ import (
 
 	"github.com/go-logr/logr"
 	. "github.com/onsi/gomega"
-	"github.com/securesign/operator/api/v1alpha1"
-	common "github.com/securesign/operator/internal/controller/common/action"
-	"github.com/securesign/operator/internal/controller/common/utils/kubernetes"
-	"github.com/securesign/operator/internal/controller/constants"
-	"github.com/securesign/operator/internal/controller/labels"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	common "github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/constants"
+	"github.com/securesign/operator/internal/labels"
+	"github.com/securesign/operator/internal/state"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 var testAction = resolveKeysAction{
 	BaseAction: common.BaseAction{
 		Client:   fake.NewFakeClient(),
-		Recorder: record.NewFakeRecorder(3),
+		Recorder: events.NewFakeRecorder(3),
 		Logger:   logr.Logger{},
 	},
 }
@@ -30,17 +31,23 @@ var testContext = context.TODO()
 func TestKeyAutogenerate(t *testing.T) {
 	g := NewWithT(t)
 
-	g.Expect(testAction.Client.Create(testContext, kubernetes.CreateSecret("testSecret", t.Name(),
-		map[string][]byte{"key": nil}, map[string]string{labels.LabelNamespace + "/rekor.pub": "key"}))).To(Succeed())
-	instance := &v1alpha1.Tuf{Spec: v1alpha1.TufSpec{Keys: []v1alpha1.TufKey{
+	g.Expect(testAction.Client.Create(testContext, &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "testSecret",
+			Namespace: t.Name(),
+			Labels:    map[string]string{labels.LabelNamespace + "/rekor.pub": "key"},
+		},
+		Data: map[string][]byte{"key": nil},
+	})).To(Succeed())
+	instance := &rhtasv1.Tuf{Spec: rhtasv1.TufSpec{Keys: []rhtasv1.TufKey{
 		{
 			Name: "rekor.pub",
 		},
 	}},
-		Status: v1alpha1.TufStatus{Conditions: []metav1.Condition{
+		Status: rhtasv1.TufStatus{Conditions: []metav1.Condition{
 			{
-				Type:   constants.Ready,
-				Reason: constants.Pending,
+				Type:   constants.ReadyCondition,
+				Reason: state.Pending.String(),
 				Status: metav1.ConditionFalse,
 			},
 		}}}
@@ -55,50 +62,51 @@ func TestKeyAutogenerate(t *testing.T) {
 
 func TestKeyProvided(t *testing.T) {
 	g := NewWithT(t)
-	instance := &v1alpha1.Tuf{Spec: v1alpha1.TufSpec{Keys: []v1alpha1.TufKey{
+	instance := &rhtasv1.Tuf{Spec: rhtasv1.TufSpec{Keys: []rhtasv1.TufKey{
 		{
 			Name: "rekor.pub",
-			SecretRef: &v1alpha1.SecretKeySelector{
-				LocalObjectReference: v1alpha1.LocalObjectReference{
+			SecretRef: &rhtasv1.SecretKeySelector{
+				LocalObjectReference: rhtasv1.LocalObjectReference{
 					Name: "secret",
 				},
 				Key: "key",
 			},
 		},
 	}},
-		Status: v1alpha1.TufStatus{Conditions: []metav1.Condition{
+		Status: rhtasv1.TufStatus{Conditions: []metav1.Condition{
 			{
-				Type:   constants.Ready,
-				Reason: constants.Pending,
+				Type:   constants.ReadyCondition,
+				Reason: state.Pending.String(),
 				Status: metav1.ConditionFalse,
 			}}}}
 	testAction.Handle(testContext, instance)
 
 	g.Expect(instance.Status.Keys).To(HaveLen(1))
-	g.Expect(instance.Status.Keys[0]).To(Equal(instance.Spec.Keys[0]))
+	g.Expect(instance.Status.Keys[0].Name).To(Equal(instance.Spec.Keys[0].Name))
+	g.Expect(instance.Status.Keys[0].SecretRef).To(Equal(instance.Spec.Keys[0].SecretRef))
 
 	g.Expect(meta.IsStatusConditionTrue(instance.Status.Conditions, "rekor.pub")).To(BeTrue())
 }
 
 func TestKeyUpdate(t *testing.T) {
 	g := NewWithT(t)
-	instance := &v1alpha1.Tuf{
-		Spec: v1alpha1.TufSpec{Keys: []v1alpha1.TufKey{
+	instance := &rhtasv1.Tuf{
+		Spec: rhtasv1.TufSpec{Keys: []rhtasv1.TufKey{
 			{
 				Name: "rekor.pub",
-				SecretRef: &v1alpha1.SecretKeySelector{
-					LocalObjectReference: v1alpha1.LocalObjectReference{
+				SecretRef: &rhtasv1.SecretKeySelector{
+					LocalObjectReference: rhtasv1.LocalObjectReference{
 						Name: "new",
 					},
 					Key: "key",
 				},
 			},
 		}},
-		Status: v1alpha1.TufStatus{Keys: []v1alpha1.TufKey{
+		Status: rhtasv1.TufStatus{Keys: []rhtasv1.TufKeyStatus{
 			{
 				Name: "rekor.pub",
-				SecretRef: &v1alpha1.SecretKeySelector{
-					LocalObjectReference: v1alpha1.LocalObjectReference{
+				SecretRef: &rhtasv1.SecretKeySelector{
+					LocalObjectReference: rhtasv1.LocalObjectReference{
 						Name: "old",
 					},
 					Key: "key",
@@ -107,8 +115,8 @@ func TestKeyUpdate(t *testing.T) {
 		},
 			Conditions: []metav1.Condition{
 				{
-					Type:   constants.Ready,
-					Reason: constants.Pending,
+					Type:   constants.ReadyCondition,
+					Reason: state.Pending.String(),
 					Status: metav1.ConditionFalse,
 				}}}}
 
@@ -116,27 +124,34 @@ func TestKeyUpdate(t *testing.T) {
 
 	g.Expect(instance.Status.Keys).To(HaveLen(1))
 	g.Expect(instance.Status.Keys[0].SecretRef.Name).To(Equal("new"))
-	g.Expect(instance.Status.Keys[0]).To(Equal(instance.Spec.Keys[0]))
+	g.Expect(instance.Status.Keys[0].Name).To(Equal(instance.Spec.Keys[0].Name))
+	g.Expect(instance.Status.Keys[0].SecretRef).To(Equal(instance.Spec.Keys[0].SecretRef))
 
 	g.Expect(meta.IsStatusConditionTrue(instance.Status.Conditions, "rekor.pub")).To(BeTrue())
 }
 
 func TestKeyDelete(t *testing.T) {
 	g := NewWithT(t)
-	g.Expect(testAction.Client.Create(testContext, kubernetes.CreateSecret("new", t.Name(),
-		map[string][]byte{"key": nil}, map[string]string{labels.LabelNamespace + "/ctfe.pub": "key"}))).To(Succeed())
-	instance := &v1alpha1.Tuf{
-		Spec: v1alpha1.TufSpec{Keys: []v1alpha1.TufKey{
+	g.Expect(testAction.Client.Create(testContext, &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "new",
+			Namespace: t.Name(),
+			Labels:    map[string]string{labels.LabelNamespace + "/ctfe.pub": "key"},
+		},
+		Data: map[string][]byte{"key": nil},
+	})).To(Succeed())
+	instance := &rhtasv1.Tuf{
+		Spec: rhtasv1.TufSpec{Keys: []rhtasv1.TufKey{
 			{
 				Name:      "ctfe.pub",
 				SecretRef: nil,
 			},
 		}},
-		Status: v1alpha1.TufStatus{Keys: []v1alpha1.TufKey{
+		Status: rhtasv1.TufStatus{Keys: []rhtasv1.TufKeyStatus{
 			{
 				Name: "ctfe.pub",
-				SecretRef: &v1alpha1.SecretKeySelector{
-					LocalObjectReference: v1alpha1.LocalObjectReference{
+				SecretRef: &rhtasv1.SecretKeySelector{
+					LocalObjectReference: rhtasv1.LocalObjectReference{
 						Name: "old",
 					},
 					Key: "key",
@@ -145,8 +160,8 @@ func TestKeyDelete(t *testing.T) {
 		},
 			Conditions: []metav1.Condition{
 				{
-					Type:   constants.Ready,
-					Reason: constants.Pending,
+					Type:   constants.ReadyCondition,
+					Reason: state.Pending.String(),
 					Status: metav1.ConditionFalse,
 				},
 			}}}

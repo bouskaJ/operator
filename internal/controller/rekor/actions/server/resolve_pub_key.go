@@ -5,16 +5,19 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"slices"
 	"strconv"
 
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/annotations"
-	"github.com/securesign/operator/internal/controller/common/action"
-	k8sutils "github.com/securesign/operator/internal/controller/common/utils/kubernetes"
-	"github.com/securesign/operator/internal/controller/constants"
-	"github.com/securesign/operator/internal/controller/labels"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/action"
+	"github.com/securesign/operator/internal/annotations"
 	"github.com/securesign/operator/internal/controller/rekor/actions"
+	"github.com/securesign/operator/internal/labels"
+	"github.com/securesign/operator/internal/state"
+	"github.com/securesign/operator/internal/utils/kubernetes"
+	"github.com/securesign/operator/internal/utils/kubernetes/ensure"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,7 +30,7 @@ const (
 	pubSecretNameFormat = "rekor-public-%s-"
 )
 
-func NewResolvePubKeyAction() action.Action[*rhtasv1alpha1.Rekor] {
+func NewResolvePubKeyAction() action.Action[*rhtasv1.Rekor] {
 	return &resolvePubKeyAction{}
 }
 
@@ -39,12 +42,12 @@ func (i resolvePubKeyAction) Name() string {
 	return "resolve public key"
 }
 
-func (i resolvePubKeyAction) CanHandle(_ context.Context, instance *rhtasv1alpha1.Rekor) bool {
+func (i resolvePubKeyAction) CanHandle(_ context.Context, instance *rhtasv1.Rekor) bool {
 	return meta.IsStatusConditionTrue(instance.Status.Conditions, actions.ServerCondition) &&
 		instance.Status.PublicKeyRef == nil
 }
 
-func (i resolvePubKeyAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Rekor) *action.Result {
+func (i resolvePubKeyAction) Handle(ctx context.Context, instance *rhtasv1.Rekor) *action.Result {
 	var (
 		err            error
 		publicKey      []byte
@@ -54,85 +57,87 @@ func (i resolvePubKeyAction) Handle(ctx context.Context, instance *rhtasv1alpha1
 	// Resolve public key from Rekors API
 	publicKey, err = i.resolvePubKey(*instance)
 	if err != nil {
-		errf := fmt.Errorf("ResolvePubKey: unable to resolve public key: %v", err)
-		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
+		err := fmt.Errorf("ResolvePubKey: unable to resolve public key: %v", err)
+		return i.Error(ctx, err, instance, metav1.Condition{
 			Type:    actions.ServerCondition,
 			Status:  metav1.ConditionFalse,
-			Reason:  constants.Failure,
-			Message: errf.Error(),
+			Reason:  state.Failure.String(),
+			Message: err.Error(),
 		})
-		return i.FailedWithStatusUpdate(ctx, errf, instance)
 	}
 
-	if partialSecrets, err = k8sutils.ListSecrets(ctx, i.Client, instance.Namespace, RekorPubLabel); err != nil {
-		return i.Failed(fmt.Errorf("ResolvePubKey: find secrets failed: %w", err))
+	if partialSecrets, err = kubernetes.ListSecrets(ctx, i.Client, instance.Namespace, RekorPubLabel); err != nil {
+		return i.Error(ctx, fmt.Errorf("ResolvePubKey: find secrets failed: %w", err), instance)
 	}
 
 	for _, partialSecret := range partialSecrets.Items {
-		sks := &rhtasv1alpha1.SecretKeySelector{Key: partialSecret.Labels[RekorPubLabel], LocalObjectReference: rhtasv1alpha1.LocalObjectReference{Name: partialSecret.Name}}
-		existingPublicKey, err := k8sutils.GetSecretData(i.Client, instance.Namespace, sks)
+		sks := &rhtasv1.SecretKeySelector{Key: partialSecret.Labels[RekorPubLabel], LocalObjectReference: rhtasv1.LocalObjectReference{Name: partialSecret.Name}}
+		existingPublicKey, err := kubernetes.GetSecretData(i.Client, instance.Namespace, sks)
 		if err != nil {
-			return i.Failed(fmt.Errorf("ResolvePubKey: failed to read `%s` secret's data: %w", sks.Name, err))
+			return i.Error(ctx, fmt.Errorf("ResolvePubKey: failed to read `%s` secret's data: %w", sks.Name, err), instance)
 		}
 		if bytes.Equal(existingPublicKey, publicKey) && instance.Status.PublicKeyRef == nil {
 			instance.Status.PublicKeyRef = sks
-			i.Recorder.Eventf(instance, v1.EventTypeNormal, "PublicKeySecretDiscovered", "Existing public key discovered: %s", sks.Name)
+			i.Recorder.Eventf(instance, nil, v1.EventTypeNormal, "PublicKeySecretDiscovered", "Discovered", "Existing public key discovered: %s", sks.Name)
 		} else {
 			if err = labels.Remove(ctx, &partialSecret, i.Client, RekorPubLabel); err != nil {
-				return i.Failed(fmt.Errorf("ResolvePubKey: %w", err))
+				return i.Error(ctx, fmt.Errorf("ResolvePubKey: %w", err), instance)
 			}
 			message := fmt.Sprintf("Removed '%s' label from %s secret", RekorPubLabel, partialSecret.Name)
-			i.Recorder.Event(instance, v1.EventTypeNormal, "PublicKeySecretLabelRemoved", message)
+			i.Recorder.Eventf(instance, nil, v1.EventTypeNormal, "PublicKeySecretLabelRemoved", "LabelRemoved", message)
 			i.Logger.Info(message)
 		}
 	}
 	if instance.Status.PublicKeyRef != nil {
-		return i.StatusUpdate(ctx, instance)
+		return i.ReturnOnChange(i.PersistStatus)(ctx, instance)
 	}
 
 	// Create new secret with public key
 	const keyName = "public"
-	labels := labels.For(actions.ServerComponentName, actions.ServerDeploymentName, instance.Name)
-	labels[RekorPubLabel] = keyName
+	componentLabels := labels.For(actions.ServerComponentName, actions.ServerDeploymentName, instance.Name)
+	keyLabels := map[string]string{RekorPubLabel: keyName}
+	anno := map[string]string{annotations.TreeId: strconv.FormatInt(ptr.Deref(instance.Status.TreeID, 0), 10)}
 
-	newConfig := k8sutils.CreateImmutableSecret(
-		fmt.Sprintf(pubSecretNameFormat, instance.Name),
-		instance.Namespace,
-		map[string][]byte{
-			keyName: publicKey,
+	newConfig := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: fmt.Sprintf(pubSecretNameFormat, instance.Name),
+			Namespace:    instance.Namespace,
 		},
-		labels)
-
-	if newConfig.Annotations == nil {
-		newConfig.Annotations = make(map[string]string)
-	}
-	newConfig.Annotations[annotations.TreeId] = strconv.FormatInt(ptr.Deref(instance.Status.TreeID, 0), 10)
-
-	if err = i.Client.Create(ctx, newConfig); err != nil {
-		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
-			Type:    actions.ServerCondition,
-			Status:  metav1.ConditionFalse,
-			Reason:  constants.Failure,
-			Message: err.Error(),
-		})
-		return i.FailedWithStatusUpdate(ctx, err, instance)
 	}
 
-	i.Recorder.Eventf(instance, v1.EventTypeNormal, "PublicKeySecretCreated", "New Rekor public key created: %s", newConfig.Name)
+	if _, err = kubernetes.CreateOrUpdate(ctx, i.Client,
+		newConfig,
+		ensure.Labels[*v1.Secret](slices.Collect(maps.Keys(componentLabels)), componentLabels),
+		ensure.Labels[*v1.Secret](slices.Collect(maps.Keys(keyLabels)), keyLabels),
+		ensure.Annotations[*v1.Secret](slices.Collect(maps.Keys(anno)), anno),
+		kubernetes.EnsureSecretData(true, map[string][]byte{
+			keyName: publicKey,
+		}),
+	); err != nil {
+		return i.Error(ctx, fmt.Errorf("could not create Server config: %w", err), instance,
+			metav1.Condition{
+				Type:    actions.ServerCondition,
+				Status:  metav1.ConditionFalse,
+				Reason:  state.Failure.String(),
+				Message: err.Error(),
+			})
+	}
+
+	i.Recorder.Eventf(instance, newConfig, v1.EventTypeNormal, "PublicKeySecretCreated", "Created", "New Rekor public key created: %s", newConfig.Name)
 	c := meta.FindStatusCondition(instance.Status.Conditions, actions.ServerCondition)
 	c.Message = "Public key resolved"
 	meta.SetStatusCondition(&instance.Status.Conditions, *c)
-	return i.StatusUpdate(ctx, instance)
+	return i.ReturnOnChange(i.PersistStatus)(ctx, instance)
 }
 
-func (i resolvePubKeyAction) resolvePubKey(instance rhtasv1alpha1.Rekor) ([]byte, error) {
+func (i resolvePubKeyAction) resolvePubKey(instance rhtasv1.Rekor) ([]byte, error) {
 	var (
 		data []byte
 		err  error
 		url  = fmt.Sprintf("http://%s.%s.svc", actions.ServerDeploymentName, instance.Namespace)
 	)
 
-	inContainer, err := k8sutils.ContainerMode()
+	inContainer, err := kubernetes.ContainerMode()
 	if err == nil {
 		if !inContainer && instance.Status.Url != "" {
 			url = instance.Status.Url

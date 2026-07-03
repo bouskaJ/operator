@@ -1,185 +1,187 @@
 package trillianUtils
 
 import (
-	"context"
 	"errors"
+	"fmt"
 	"strconv"
 
-	"github.com/securesign/operator/api/v1alpha1"
-	"github.com/securesign/operator/internal/controller/common/utils"
-	"github.com/securesign/operator/internal/controller/constants"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/constants"
 	"github.com/securesign/operator/internal/controller/trillian/actions"
+	"github.com/securesign/operator/internal/images"
+	"github.com/securesign/operator/internal/utils"
+	"github.com/securesign/operator/internal/utils/kubernetes"
+	"github.com/securesign/operator/internal/utils/kubernetes/ensure/deployment"
+	"github.com/securesign/operator/internal/utils/tls"
 	apps "k8s.io/api/apps/v1"
 	core "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
-func CreateLogServerDeployment(ctx context.Context, client client.Client, instance *v1alpha1.Trillian, image string, dpName string, sa string, labels map[string]string) (*apps.Deployment, error) {
-	if instance.Status.Db.DatabaseSecretRef == nil {
-		return nil, errors.New("reference to database secret is not set")
-	}
-	replicas := int32(1)
-	containerPorts := []core.ContainerPort{
-		{
-			Protocol:      core.ProtocolTCP,
-			ContainerPort: 8091,
-		},
-	}
+func EnsureServerDeployment(instance *rhtasv1.Trillian, labels map[string]string, caPath string) []func(*apps.Deployment) error {
+	return append(append([]func(deployment *apps.Deployment) error{
+		ensureDeployment(instance,
+			images.Registry.Get(images.TrillianServer),
+			actions.LogserverDeploymentName,
+			actions.RBACServerName,
+			labels),
+		ensureProbes(actions.LogserverDeploymentName),
+		deployment.PodRequirements(instance.Spec.LogServer.PodRequirements, actions.LogserverDeploymentName),
+		deployment.Proxy(),
+		deployment.GODEBUG(instance.GetAnnotations()),
+		deployment.TrustedCA(instance.GetTrustedCA(), actions.LogserverDeploymentName)},
+		EnsureDB(instance, actions.LogserverDeploymentName, caPath)...),
+		deployment.PodSecurityContext())
+}
 
-	if instance.Spec.Monitoring.Enabled {
-		containerPorts = append(containerPorts, core.ContainerPort{
-			Protocol:      core.ProtocolTCP,
-			ContainerPort: 8090,
-		})
-	}
+func EnsureSignerDeployment(instance *rhtasv1.Trillian, labels map[string]string, caPath string) []func(*apps.Deployment) error {
+	return append(append([]func(deployment *apps.Deployment) error{
+		ensureDeployment(instance,
+			images.Registry.Get(images.TrillianLogSigner),
+			actions.LogsignerDeploymentName,
+			actions.RBACSignerName,
+			labels,
+			"--election_system=k8s", "--lock_namespace=$(NAMESPACE)", "--lock_holder_identity=$(POD_NAME)", "--master_hold_interval=5s", "--master_hold_jitter=15s"),
+		ensureProbes(actions.LogsignerDeploymentName),
+		deployment.PodRequirements(instance.Spec.LogSigner.PodRequirements, actions.LogsignerDeploymentName),
+		deployment.Proxy(),
+		deployment.GODEBUG(instance.GetAnnotations()),
+		deployment.TrustedCA(instance.GetTrustedCA(), actions.LogsignerDeploymentName),
+	},
+		EnsureDB(instance, actions.LogsignerDeploymentName, caPath)...),
+		deployment.PodSecurityContext())
+}
 
-	dep := &apps.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      dpName,
-			Namespace: instance.Namespace,
-			Labels:    labels,
-		},
-		Spec: apps.DeploymentSpec{
-			Replicas: &replicas,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: labels,
-			},
-			Template: core.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: labels,
-				},
-				Spec: core.PodSpec{
-					ServiceAccountName: sa,
-					InitContainers: []core.Container{
-						{
-							Name:  "wait-for-trillian-db",
-							Image: constants.TrillianNetcatImage,
-							Env: []core.EnvVar{
-								{
-									Name: "MYSQL_HOSTNAME",
-									ValueFrom: &core.EnvVarSource{
-										SecretKeyRef: &core.SecretKeySelector{
-											Key: SecretHost,
-											LocalObjectReference: core.LocalObjectReference{
-												Name: instance.Status.Db.DatabaseSecretRef.Name,
-											},
-										},
-									},
-								},
-								{
-									Name: "MYSQL_PORT",
-									ValueFrom: &core.EnvVarSource{
-										SecretKeyRef: &core.SecretKeySelector{
-											Key: SecretPort,
-											LocalObjectReference: core.LocalObjectReference{
-												Name: instance.Status.Db.DatabaseSecretRef.Name,
-											},
-										},
-									},
-								},
-							},
-							Command: []string{
-								"sh",
-								"-c",
-								"until nc -z -v -w30 $MYSQL_HOSTNAME $MYSQL_PORT; do echo \"Waiting for MySQL to start\"; sleep 5; done;",
-							},
-						},
-					},
-					Containers: []core.Container{
-						{
-							Args: []string{
-								"--storage_system=mysql",
-								"--quota_system=mysql",
-								"--mysql_uri=$(MYSQL_USER):$(MYSQL_PASSWORD)@tcp($(MYSQL_HOSTNAME):$(MYSQL_PORT))/$(MYSQL_DATABASE)",
-								"--rpc_endpoint=0.0.0.0:" + strconv.Itoa(int(actions.ServerPort)),
-								"--http_endpoint=0.0.0.0:" + strconv.Itoa(int(actions.MetricsPort)),
-								"--alsologtostderr",
-							},
-							Name:  dpName,
-							Image: image,
-							Ports: containerPorts,
-							// Env variables from secret trillian-mysql
-							Env: []core.EnvVar{
-								{
-									Name: "MYSQL_USER",
-									ValueFrom: &core.EnvVarSource{
-										SecretKeyRef: &core.SecretKeySelector{
-											Key: SecretUser,
-											LocalObjectReference: core.LocalObjectReference{
-												Name: instance.Status.Db.DatabaseSecretRef.Name,
-											},
-										},
-									},
-								},
-								{
-									Name: "MYSQL_PASSWORD",
-									ValueFrom: &core.EnvVarSource{
-										SecretKeyRef: &core.SecretKeySelector{
-											Key: SecretPassword,
-											LocalObjectReference: core.LocalObjectReference{
-												Name: instance.Status.Db.DatabaseSecretRef.Name,
-											},
-										},
-									},
-								},
-								{
-									Name: "MYSQL_HOSTNAME",
-									ValueFrom: &core.EnvVarSource{
-										SecretKeyRef: &core.SecretKeySelector{
-											Key: SecretHost,
-											LocalObjectReference: core.LocalObjectReference{
-												Name: instance.Status.Db.DatabaseSecretRef.Name,
-											},
-										},
-									},
-								},
-								{
-									Name: "MYSQL_PORT",
-									ValueFrom: &core.EnvVarSource{
-										SecretKeyRef: &core.SecretKeySelector{
-											Key: SecretPort,
-											LocalObjectReference: core.LocalObjectReference{
-												Name: instance.Status.Db.DatabaseSecretRef.Name,
-											},
-										},
-									},
-								},
-								{
-									Name: "MYSQL_DATABASE",
-									ValueFrom: &core.EnvVarSource{
-										SecretKeyRef: &core.SecretKeySelector{
-											Key: SecretDatabaseName,
-											LocalObjectReference: core.LocalObjectReference{
-												Name: instance.Status.Db.DatabaseSecretRef.Name,
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
+func ensureProbes(containerName string) func(*apps.Deployment) error {
+	return func(deployment *apps.Deployment) error {
+		container := kubernetes.FindContainerByNameOrCreate(&deployment.Spec.Template.Spec, containerName)
 
-	// TLS communication to database
-	if UseTLS(instance) {
-		caPath, err := CAPath(ctx, client, instance)
-		if err != nil {
-			return nil, errors.New("failed to get CA path: " + err.Error())
+		if container.LivenessProbe == nil {
+			container.LivenessProbe = &core.Probe{}
+		}
+		if container.LivenessProbe.HTTPGet == nil {
+			container.LivenessProbe.HTTPGet = &core.HTTPGetAction{}
+		}
+		container.LivenessProbe.HTTPGet.Path = constants.HealthzPath
+		container.LivenessProbe.HTTPGet.Port = intstr.FromInt32(actions.MetricsPort)
+		container.LivenessProbe.InitialDelaySeconds = 0
+		container.LivenessProbe.PeriodSeconds = 10
+		container.LivenessProbe.TimeoutSeconds = 1
+		container.LivenessProbe.FailureThreshold = 3
+
+		if container.ReadinessProbe == nil {
+			container.ReadinessProbe = &core.Probe{}
+		}
+		if container.ReadinessProbe.HTTPGet == nil {
+			container.ReadinessProbe.HTTPGet = &core.HTTPGetAction{}
+		}
+		container.ReadinessProbe.HTTPGet.Path = constants.HealthzPath
+		container.ReadinessProbe.HTTPGet.Port = intstr.FromInt32(actions.MetricsPort)
+		container.ReadinessProbe.InitialDelaySeconds = 0
+		container.ReadinessProbe.PeriodSeconds = 10
+		container.ReadinessProbe.TimeoutSeconds = 1
+		container.ReadinessProbe.FailureThreshold = 3
+
+		if container.StartupProbe == nil {
+			container.StartupProbe = &core.Probe{}
+		}
+		if container.StartupProbe.HTTPGet == nil {
+			container.StartupProbe.HTTPGet = &core.HTTPGetAction{}
+		}
+		container.StartupProbe.HTTPGet.Path = constants.HealthzPath
+		container.StartupProbe.HTTPGet.Port = intstr.FromInt32(actions.MetricsPort)
+		container.StartupProbe.PeriodSeconds = 5
+		container.StartupProbe.TimeoutSeconds = 5
+		container.StartupProbe.FailureThreshold = 12
+
+		return nil
+	}
+}
+
+func ensureDeployment(instance *rhtasv1.Trillian, image string, name string, sa string, labels map[string]string, args ...string) func(*apps.Deployment) error {
+	return func(dp *apps.Deployment) error {
+		if instance.Status.Db.DatabaseSecretRef == nil && utils.OptionalBool(instance.Spec.Db.Create) {
+			return errors.New("reference to database secret is not set")
 		}
 
-		dep.Spec.Template.Spec.Containers[0].Args = append(dep.Spec.Template.Spec.Containers[0].Args, "--mysql_tls_ca", caPath)
-
-		mysqlServerName := "$(MYSQL_HOSTNAME)." + instance.Namespace + ".svc"
-		if !*instance.Spec.Db.Create {
-			mysqlServerName = "$(MYSQL_HOSTNAME)"
+		spec := &dp.Spec
+		spec.Selector = &metav1.LabelSelector{
+			MatchLabels: labels,
 		}
-		dep.Spec.Template.Spec.Containers[0].Args = append(dep.Spec.Template.Spec.Containers[0].Args, "--mysql_server_name", mysqlServerName)
-	}
 
-	utils.SetProxyEnvs(dep)
-	return dep, nil
+		template := &spec.Template
+		template.Labels = labels
+		template.Spec.ServiceAccountName = sa
+
+		container := kubernetes.FindContainerByNameOrCreate(&template.Spec, name)
+		container.Image = image
+
+		container.Args = append([]string{
+			"--storage_system=" + instance.Spec.Db.Provider,
+			"--quota_system=" + instance.Spec.Db.Provider,
+			"--rpc_endpoint=0.0.0.0:" + strconv.Itoa(int(actions.ServerPort)),
+			"--http_endpoint=0.0.0.0:" + strconv.Itoa(int(actions.MetricsPort)),
+			"--alsologtostderr",
+		}, args...)
+
+		if instance.Spec.MaxRecvMessageSize != nil {
+			container.Args = append(container.Args, "--max_msg_size_bytes", fmt.Sprintf("%d", *instance.Spec.MaxRecvMessageSize))
+		}
+
+		podNameEnv := kubernetes.FindEnvByNameOrCreate(container, "POD_NAME")
+		podNameEnv.ValueFrom = &core.EnvVarSource{
+			FieldRef: &core.ObjectFieldSelector{
+				APIVersion: "v1",
+				FieldPath:  "metadata.name",
+			},
+		}
+
+		namespaceEnv := kubernetes.FindEnvByNameOrCreate(container, "NAMESPACE")
+		namespaceEnv.ValueFrom = &core.EnvVarSource{
+			FieldRef: &core.ObjectFieldSelector{
+				APIVersion: "v1",
+				FieldPath:  "metadata.namespace",
+			},
+		}
+
+		port := kubernetes.FindPortByNameOrCreate(container, "8091-tcp")
+		port.ContainerPort = actions.ServerPort
+		port.Protocol = core.ProtocolTCP
+
+		if utils.IsEnabled(instance.Spec.Monitoring.Enabled) {
+			monitoring := kubernetes.FindPortByNameOrCreate(container, "monitoring")
+			monitoring.ContainerPort = actions.MetricsPort
+			monitoring.Protocol = core.ProtocolTCP
+		}
+		return nil
+	}
+}
+
+func EnsureTLS(tlsConfig rhtasv1.TLS, name string) func(*apps.Deployment) error {
+	return func(dp *apps.Deployment) error {
+		if err := deployment.TLS(tlsConfig, name)(dp); err != nil {
+			return err
+		}
+
+		container := kubernetes.FindContainerByNameOrCreate(&dp.Spec.Template.Spec, name)
+
+		container.Args = append(container.Args, "--tls_cert_file", tls.TLSCertPath)
+
+		if container.ReadinessProbe != nil {
+			container.ReadinessProbe.HTTPGet.Scheme = core.URISchemeHTTPS
+		}
+
+		if container.LivenessProbe != nil {
+			container.LivenessProbe.HTTPGet.Scheme = core.URISchemeHTTPS
+		}
+
+		if container.StartupProbe != nil {
+			container.StartupProbe.HTTPGet.Scheme = core.URISchemeHTTPS
+		}
+
+		container.Args = append(container.Args, "--tls_key_file", tls.TLSKeyPath)
+
+		return nil
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -20,7 +21,7 @@ const (
 )
 
 func OidcIssuerUrl() string {
-	return EnvOrDefault(OIDC_ISSUER_URL, "http://keycloak-internal.keycloak-system.svc/auth/realms/trusted-artifact-signer")
+	return EnvOrDefault(OIDC_ISSUER_URL, "http://keycloak-internal.keycloak-system.svc/realms/trusted-artifact-signer")
 }
 
 func OidcClientID() string {
@@ -45,6 +46,14 @@ func OidcToken(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Success is indicated with 2xx status codes:
+	statusOK := resp.StatusCode >= 200 && resp.StatusCode < 300
+	if !statusOK {
+		return "", fmt.Errorf("unexpected HTTP status code response: %s", resp.Status)
+	}
+
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err

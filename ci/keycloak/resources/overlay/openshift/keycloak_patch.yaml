@@ -1,0 +1,9 @@
+apiVersion: k8s.keycloak.org/v2alpha1
+kind: Keycloak
+metadata:
+  name: keycloak
+spec:
+  hostname:
+    hostname: PLACEHOLDER
+  ingress:
+    enabled: true

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "github>securesign/renovate-config//org-inherited-config.json"
+  ],
+  "packageRules": [
+    {
+      "description": "Group all images.env container image updates together",
+      "matchManagers": ["custom.regex"],
+      "matchDatasources": ["docker"],
+      "groupName": "Docker Images",
+      "groupSlug": "docker-deps"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Update container images in images.env files",
+      "managerFilePatterns": [
+        "/images\\.env$/"
+      ],
+      "matchStrings": [
+        "RELATED_IMAGE_[A-Z_]+=(?<depName>[0-9a-z./-]+)(?::(?<currentValue>[0-9a-z.-]+))?@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "redhat"
+    }
+  ]
+}

@@ -3,22 +3,19 @@ package ui
 import (
 	"context"
 	"errors"
+	"time"
 
-	"github.com/securesign/operator/internal/controller/common/action"
-	"github.com/securesign/operator/internal/controller/common/utils"
-	"github.com/securesign/operator/internal/controller/constants"
-	"github.com/securesign/operator/internal/controller/labels"
+	rhtasv1 "github.com/securesign/operator/api/v1"
+	"github.com/securesign/operator/internal/action"
 	"github.com/securesign/operator/internal/controller/rekor/actions"
-	v12 "k8s.io/api/networking/v1"
+	"github.com/securesign/operator/internal/labels"
+	"github.com/securesign/operator/internal/state"
+	commonUtils "github.com/securesign/operator/internal/utils/kubernetes"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-
-	rhtasv1alpha1 "github.com/securesign/operator/api/v1alpha1"
-	commonUtils "github.com/securesign/operator/internal/controller/common/utils/kubernetes"
 )
 
-func NewInitializeAction() action.Action[*rhtasv1alpha1.Rekor] {
+func NewInitializeAction() action.Action[*rhtasv1.Rekor] {
 	return &initializeAction{}
 }
 
@@ -30,12 +27,11 @@ func (i initializeAction) Name() string {
 	return "initialize"
 }
 
-func (i initializeAction) CanHandle(ctx context.Context, instance *rhtasv1alpha1.Rekor) bool {
-	return meta.IsStatusConditionFalse(instance.Status.Conditions, actions.UICondition) &&
-		utils.IsEnabled(instance.Spec.RekorSearchUI.Enabled)
+func (i initializeAction) CanHandle(ctx context.Context, instance *rhtasv1.Rekor) bool {
+	return meta.IsStatusConditionFalse(instance.Status.Conditions, actions.UICondition) && enabled(instance)
 }
 
-func (i initializeAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Rekor) *action.Result {
+func (i initializeAction) Handle(ctx context.Context, instance *rhtasv1.Rekor) *action.Result {
 	var (
 		ok  bool
 		err error
@@ -46,33 +42,24 @@ func (i initializeAction) Handle(ctx context.Context, instance *rhtasv1alpha1.Re
 	case errors.Is(err, commonUtils.ErrDeploymentNotReady):
 		i.Logger.Error(err, "deployment is not ready")
 	case err != nil:
-		return i.Failed(err)
+		return i.Error(ctx, err, instance)
 	}
 	if !ok {
 		i.Logger.Info("Waiting for deployment")
 		meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{
 			Type:    actions.UICondition,
 			Status:  metav1.ConditionFalse,
-			Reason:  constants.Initialize,
+			Reason:  state.Initialize.String(),
 			Message: "Waiting for deployment to be ready",
 		})
-		return i.StatusUpdate(ctx, instance)
+		if _, err := i.PersistStatus(ctx, instance); err != nil {
+			return i.Error(ctx, err, instance)
+		}
+		return i.RequeueAfter(5 * time.Second)
 	}
 
-	protocol := "http://"
-	ingress := &v12.Ingress{}
-	err = i.Client.Get(ctx, types.NamespacedName{Name: actions.SearchUiDeploymentName, Namespace: instance.Namespace}, ingress)
-	if err != nil {
-		// condition error
-		return i.FailedWithStatusUpdate(ctx, err, instance)
-	}
-	if len(ingress.Spec.TLS) > 0 {
-		protocol = "https://"
-	}
-
-	instance.Status.RekorSearchUIUrl = protocol + ingress.Spec.Rules[0].Host
 	meta.SetStatusCondition(&instance.Status.Conditions, metav1.Condition{Type: actions.UICondition,
-		Status: metav1.ConditionTrue, Reason: constants.Ready})
+		Status: metav1.ConditionTrue, Reason: state.Ready.String()})
 
-	return i.StatusUpdate(ctx, instance)
+	return i.ReturnOnChange(i.PersistStatus)(ctx, instance)
 }

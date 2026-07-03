@@ -1,13 +1,20 @@
 package utils
 
 import (
-	"github.com/securesign/operator/api/v1alpha1"
+	rhtasv1 "github.com/securesign/operator/api/v1"
 	core "k8s.io/api/core/v1"
 )
 
-func secretsVolumeProjection(keys []v1alpha1.TufKey) *core.ProjectedVolumeSource {
+const (
+	rekorKey  = "rekor.pub"
+	ctfeKey   = "ctfe.pub"
+	fulcioKey = "fulcio_v1.crt.pem"
+	tsaKey    = "tsa.certchain.pem"
+)
 
-	projections := make([]core.VolumeProjection, 0)
+func secretsVolumeProjection(keys []rhtasv1.TufKeyStatus) *core.ProjectedVolumeSource {
+
+	projections := make([]core.VolumeProjection, 0, len(keys))
 
 	for _, key := range keys {
 		p := core.VolumeProjection{Secret: selectorToProjection(key.SecretRef, key.Name)}
@@ -19,7 +26,7 @@ func secretsVolumeProjection(keys []v1alpha1.TufKey) *core.ProjectedVolumeSource
 	}
 }
 
-func selectorToProjection(secret *v1alpha1.SecretKeySelector, path string) *core.SecretProjection {
+func selectorToProjection(secret *rhtasv1.SecretKeySelector, path string) *core.SecretProjection {
 	return &core.SecretProjection{
 		LocalObjectReference: core.LocalObjectReference{
 			Name: secret.Name,
