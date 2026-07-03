@@ -39,6 +39,14 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    - name: Load kernel modules
+      shell: bash
+      run: |
+        sudo modprobe overlay || true
+        sudo modprobe bridge || true
+        sudo modprobe br_netfilter || true
+        sudo sysctl -q -w net.bridge.bridge-nf-call-iptables=1 || true
+
     - name: Install vCluster CLI
       shell: bash
       run: |
@@ -98,9 +106,11 @@ runs:
       run: |
         vcluster use driver docker
         vcluster create ci-cluster \
+          --connect=false \
           --restore "oci://${{ inputs.snapshot-registry }}:${{ steps.snapshot.outputs.tag }}" \
           --values ci/vcluster.yaml \
-          --kubernetes-version ${{ inputs.kubernetes-version }}
+          --set controlPlane.distro.k8s.image.tag=v${{ inputs.kubernetes-version }}
+        vcluster connect ci-cluster --update-current
 
     - name: Wait for ingress-nginx
       shell: bash

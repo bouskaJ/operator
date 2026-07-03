@@ -46,12 +46,21 @@ jobs:
           chmod +x /usr/local/bin/vcluster
           vcluster --version
 
+      - name: Load kernel modules
+        run: |
+          sudo modprobe overlay || true
+          sudo modprobe bridge || true
+          sudo modprobe br_netfilter || true
+          sudo sysctl -q -w net.bridge.bridge-nf-call-iptables=1 || true
+
       - name: Create vind cluster
         run: |
           vcluster use driver docker
           vcluster create snapshot-builder \
+            --connect=false \
             --values ci/vcluster.yaml \
-            --kubernetes-version 1.35.0
+            --set controlPlane.distro.k8s.image.tag=v1.35.0
+          vcluster connect snapshot-builder --update-current
 
       - name: Install ingress-nginx
         run: |
@@ -140,12 +149,21 @@ jobs:
           chmod +x /usr/local/bin/vcluster
           vcluster --version
 
+      - name: Load kernel modules
+        run: |
+          sudo modprobe overlay || true
+          sudo modprobe bridge || true
+          sudo modprobe br_netfilter || true
+          sudo sysctl -q -w net.bridge.bridge-nf-call-iptables=1 || true
+
       - name: Create vind cluster
         run: |
           vcluster use driver docker
           vcluster create snapshot-builder-minimal \
+            --connect=false \
             --values ci/vcluster.yaml \
-            --kubernetes-version 1.35.0
+            --set controlPlane.distro.k8s.image.tag=v1.35.0
+          vcluster connect snapshot-builder-minimal --update-current
 
       - name: Install ingress-nginx
         run: |
