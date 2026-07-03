@@ -198,7 +198,7 @@ jobs:
           if-no-files-found: error
 
   test-kind:
-    name: Test kind deployment
+    name: Test vind deployment
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -239,20 +239,14 @@ jobs:
           auth_file_path: /tmp/config.json
 
       - name: Install Cluster
-        uses: ./.github/actions/kind-cluster
+        uses: ./.github/actions/vind-cluster
         with:
-          config: ./ci/config.yaml
           prometheus: 'true'
           keycloak: 'true'
           olm: 'true'
 
-      - name: Pull Container image from GHCR
-        run: podman pull ${{ env.IMG }}
-
-      - name: Load Docker image into Kind cluster
-        run: |
-          podman save ${{ env.IMG }} -o operator-oci.tar
-          kind load image-archive operator-oci.tar
+      - name: Pre-cache operator image
+        run: docker pull ${{ env.IMG }}
 
       - name: Replace images
         run: make dev-images && cat config/default/images.env
@@ -298,6 +292,10 @@ jobs:
         run: kubectl logs -n openshift-rhtas-operator deployment/rhtas-operator-controller-manager
         if: always()
 
+      - name: Cleanup Cluster
+        uses: ./.github/actions/vind-cluster-cleanup
+        if: always()
+
   test-upgrade:
     name: Test upgrade operator
     runs-on:
@@ -335,28 +333,17 @@ jobs:
           auth_file_path: /tmp/config.json
 
       - name: Install Cluster
-        uses: ./.github/actions/kind-cluster
+        uses: ./.github/actions/vind-cluster
         with:
-          config: ./ci/config.yaml
           prometheus: 'true'
           keycloak: 'true'
           olm: 'true'
 
-      - name: Pull Container image from GHCR
+      - name: Pre-cache container images
         run: |
-          podman pull ${{ env.IMG }}
-          podman pull ${{ env.BUNDLE_IMG }}
-          podman pull ${{ env.CATALOG_IMG }}
-
-      - name: Load Docker image into Kind cluster
-        run: |
-          podman save ${{ env.IMG }} -o operator-oci.tar
-          podman save ${{ env.BUNDLE_IMG }} -o operator-bundle-oci.tar
-          podman save ${{ env.CATALOG_IMG }} -o operator-fbc-oci.tar
-          
-          kind load image-archive operator-oci.tar
-          kind load image-archive operator-bundle-oci.tar
-          kind load image-archive operator-fbc-oci.tar
+          docker pull ${{ env.IMG }}
+          docker pull ${{ env.BUNDLE_IMG }}
+          docker pull ${{ env.CATALOG_IMG }}
 
       # The base (released) operator version does not support INGRESS_HOST_TEMPLATE,
       # so it produces static .local hostnames that require /etc/hosts entries.
@@ -386,6 +373,10 @@ jobs:
           name: test-upgrade
           path: test/**/k8s-dump-*.tar.gz
           if-no-files-found: ignore
+
+      - name: Cleanup Cluster
+        uses: ./.github/actions/vind-cluster-cleanup
+        if: always()
 
   test-ha-install:
     name: Test with High Availability
@@ -421,21 +412,15 @@ jobs:
           auth_file_path: /tmp/config.json
 
       - name: Install Cluster
-        uses: ./.github/actions/kind-cluster
+        uses: ./.github/actions/vind-cluster
         with:
-          config: ./ci/config.yaml
           prometheus: 'true'
           keycloak: 'true'
           olm: 'true'
           nfs-csi: 'true'
 
-      - name: Pull Container image from GHCR
-        run: podman pull ${{ env.IMG }}
-
-      - name: Load Docker image into Kind cluster
-        run: |
-          podman save ${{ env.IMG }} -o operator-oci.tar
-          kind load image-archive operator-oci.tar
+      - name: Pre-cache operator image
+        run: docker pull ${{ env.IMG }}
 
       - name: Replace images
         run: make dev-images && cat config/default/images.env
@@ -484,7 +469,7 @@ jobs:
         if: always()
 
       - name: Cleanup Cluster
-        uses: ./.github/actions/kind-cluster-cleanup
+        uses: ./.github/actions/vind-cluster-cleanup
         if: always()
         with:
           nfs-csi: true
@@ -523,24 +508,13 @@ jobs:
           auth_file_path: /tmp/config.json
 
       - name: Install Cluster
-        uses: ./.github/actions/kind-cluster
+        uses: ./.github/actions/vind-cluster
         with:
-          config: ./ci/config.yaml
           nfs-csi: true
-          keycloak: 'false' # keycloak use a lot of resources and is not needed for custom_intall tests
+          keycloak: 'false'
 
-      - name: Pull Container image from GHCR
-        run: |
-          podman pull ${{ env.IMG }}
-
-      - name: Load Docker image into Kind cluster
-        run: |
-          podman save ${{ env.IMG }} -o operator-oci.tar
-          kind load image-archive operator-oci.tar
-
-      - name: Add service hosts to /etc/hosts
-        run: |
-          echo "# service hosts added here if needed"
+      - name: Pre-cache operator image
+        run: docker pull ${{ env.IMG }}
 
       - name: Replace images
         run: make dev-images generate && cat config/default/images.env
@@ -559,7 +533,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Cleanup Cluster
-        uses: ./.github/actions/kind-cluster-cleanup
+        uses: ./.github/actions/vind-cluster-cleanup
         if: always()
         with:
           nfs-csi: true
@@ -605,26 +579,19 @@ jobs:
           auth_file_path: /tmp/config.json
 
       - name: Install Cluster
-        id: kind
-        uses: ./.github/actions/kind-cluster
+        id: vind
+        uses: ./.github/actions/vind-cluster
         with:
-          config: ./ci/config.yaml
           keycloak: 'true'
           olm: 'true'
           prometheus: 'true'
 
-      - name: Pull Container image from GHCR
-        run: |
-          podman pull ${{ env.IMG }}
-
-      - name: Load Docker image into Kind cluster
-        run: |
-          podman save ${{ env.IMG }} -o operator-oci.tar
-          kind load image-archive operator-oci.tar
+      - name: Pre-cache operator image
+        run: docker pull ${{ env.IMG }}
 
       - name: Add service hosts to /etc/hosts
         run: |
-          sudo echo "127.0.0.1 ${{ steps.kind.outputs.oidc_host }}" | sudo tee -a /etc/hosts
+          sudo echo "127.0.0.1 ${{ steps.vind.outputs.oidc_host }}" | sudo tee -a /etc/hosts
 
       - name: Replace images
         run: make dev-images generate && cat config/default/images.env
@@ -651,7 +618,7 @@ jobs:
 
       - name: Install securesign
         run: |
-          sed -i 's#https://your-oidc-issuer-url#http://${{ steps.kind.outputs.oidc_host }}/realms/trusted-artifact-signer#' config/samples/rhtas_v1alpha1_securesign.yaml
+          sed -i 's#https://your-oidc-issuer-url#http://${{ steps.vind.outputs.oidc_host }}/realms/trusted-artifact-signer#' config/samples/rhtas_v1alpha1_securesign.yaml
           kubectl create ns ${{ env.TEST_NAMESPACE }}
           kubectl create -f config/samples/rhtas_v1alpha1_securesign.yaml -n ${{ env.TEST_NAMESPACE }}
           sleep 1
@@ -659,7 +626,7 @@ jobs:
 
       - name: Run tests
         run: |
-          export OIDC_ISSUER_URL="http://${{ steps.kind.outputs.oidc_host }}/realms/trusted-artifact-signer"
+          export OIDC_ISSUER_URL="http://${{ steps.vind.outputs.oidc_host }}/realms/trusted-artifact-signer"
           export REKOR_UI_URL=$(kubectl  get rekor -o jsonpath='{.items[0].status.rekorSearchUIUrl}' -n ${{ env.TEST_NAMESPACE }})
           export TUF_URL=$(kubectl get tuf -o jsonpath='{.items[0].status.url}' -n ${{ env.TEST_NAMESPACE }})
           export REKOR_URL=$(kubectl get rekor -o jsonpath='{.items[0].status.url}' -n ${{ env.TEST_NAMESPACE }})
@@ -678,6 +645,10 @@ jobs:
         run: |
           kubectl logs -n openshift-rhtas-operator deployment/rhtas-operator-controller-manager
         if: failure()
+
+      - name: Cleanup Cluster
+        uses: ./.github/actions/vind-cluster-cleanup
+        if: always()
 
   build-operator-coverage:
     name: Build-operator-coverage
@@ -760,20 +731,14 @@ jobs:
           auth_file_path: /tmp/config.json
 
       - name: Install Cluster
-        uses: ./.github/actions/kind-cluster
+        uses: ./.github/actions/vind-cluster
         with:
-          config: ./ci/config.yaml
           prometheus: 'true'
           keycloak: 'true'
           olm: 'true'
 
-      - name: Pull coverage image from GHCR
-        run: podman pull ${{ env.IMG }}-coverage
-
-      - name: Load coverage image into Kind cluster
-        run: |
-          podman save ${{ env.IMG }}-coverage -o operator-coverage-oci.tar
-          kind load image-archive operator-coverage-oci.tar
+      - name: Pre-cache coverage image
+        run: docker pull ${{ env.IMG }}-coverage
 
       - name: Replace images
         run: make dev-images && cat config/default/images.env
@@ -841,4 +806,8 @@ jobs:
 
       - name: dump the logs of the operator
         run: kubectl logs -n openshift-rhtas-operator deployment/rhtas-operator-controller-manager
+        if: always()
+
+      - name: Cleanup Cluster
+        uses: ./.github/actions/vind-cluster-cleanup
         if: always()
