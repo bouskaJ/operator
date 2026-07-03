@@ -17,6 +17,7 @@ env:
   OCP_VERSION: ${{ vars.OLM_INDEX_VERSION }}
   INGRESS_HOST_TEMPLATE: '%[1]s.%[2]s.127.0.0.1.nip.io'
   TARGET_PLATFORM: kubernetes
+  SNAPSHOT_REGISTRY: ghcr.io/${{ github.repository_owner }}/operator-vind-snapshot
 
 jobs:
   build-operator:
@@ -241,6 +242,7 @@ jobs:
       - name: Install Cluster
         uses: ./.github/actions/vind-cluster
         with:
+          snapshot-registry: ${{ env.SNAPSHOT_REGISTRY }}
           prometheus: 'true'
           keycloak: 'true'
           olm: 'true'
@@ -335,6 +337,7 @@ jobs:
       - name: Install Cluster
         uses: ./.github/actions/vind-cluster
         with:
+          snapshot-registry: ${{ env.SNAPSHOT_REGISTRY }}
           prometheus: 'true'
           keycloak: 'true'
           olm: 'true'
@@ -414,6 +417,7 @@ jobs:
       - name: Install Cluster
         uses: ./.github/actions/vind-cluster
         with:
+          snapshot-registry: ${{ env.SNAPSHOT_REGISTRY }}
           prometheus: 'true'
           keycloak: 'true'
           olm: 'true'
@@ -510,6 +514,7 @@ jobs:
       - name: Install Cluster
         uses: ./.github/actions/vind-cluster
         with:
+          snapshot-registry: ${{ env.SNAPSHOT_REGISTRY }}
           nfs-csi: true
           keycloak: 'false'
 
@@ -582,6 +587,7 @@ jobs:
         id: vind
         uses: ./.github/actions/vind-cluster
         with:
+          snapshot-registry: ${{ env.SNAPSHOT_REGISTRY }}
           keycloak: 'true'
           olm: 'true'
           prometheus: 'true'
@@ -733,6 +739,7 @@ jobs:
       - name: Install Cluster
         uses: ./.github/actions/vind-cluster
         with:
+          snapshot-registry: ${{ env.SNAPSHOT_REGISTRY }}
           prometheus: 'true'
           keycloak: 'true'
           olm: 'true'
