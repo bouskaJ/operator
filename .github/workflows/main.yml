@@ -1,4 +1,4 @@
-name: Validate SecureSign
+name: Validate SecureSign # vind snapshot test
 on:
   push:
     branches: [ "main", "release*" ]
