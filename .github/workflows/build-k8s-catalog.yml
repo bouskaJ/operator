@@ -11,7 +11,7 @@ on:
 env:
   REGISTRY: ghcr.io
   CONTAINER_TOOL: podman
-  CATALOG_IMG: ghcr.io/securesign/secure-sign-operator-k8s-catalog
+  CATALOG_IMG: ghcr.io/bouskaj/secure-sign-operator-k8s-catalog
 
 jobs:
   build-catalog:
